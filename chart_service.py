@@ -1776,4 +1776,4 @@ from daily_sync import bp as daily_sync_bp
 app.register_blueprint(daily_sync_bp)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001, threaded=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5001)), threaded=True)
