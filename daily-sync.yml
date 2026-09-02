@@ -1,0 +1,26 @@
+name: Daily IBKR sync trigger
+
+# Replaces n8n's "Daily 8PM Egypt Trigger" (Schedule Trigger). Egypt is
+# UTC+2 (no DST since 2016), so 20:00 Cairo = 18:00 UTC year-round.
+# GitHub Actions cron is UTC and best-effort (can slip a few minutes under
+# load) -- fine for a daily job. This also doubles as the free-tier
+# wake-up ping: it's just a POST, chart_service.py does the real work in
+# a background thread and returns 202 immediately.
+
+on:
+  schedule:
+    - cron: "0 18 * * *"
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+
+jobs:
+  trigger-daily-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: POST /daily-sync
+        run: |
+          curl -sS -X POST "${RENDER_SERVICE_URL}/daily-sync" \
+            -w "\nHTTP %{http_code}\n" \
+            --max-time 30 \
+            --retry 3 --retry-delay 10
+        env:
+          RENDER_SERVICE_URL: ${{ secrets.RENDER_SERVICE_URL }}

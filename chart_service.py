@@ -14,7 +14,8 @@ POST /generate-chart
 
 Returns:
 {
-  "image_base64": "...",          # PNG, ready to pin into Sheets / send to vision LLM
+  "image_base64": None,            # PNG rendering is off by default (see include_image
+                                    # below) -- null unless a caller opts in
   "indicators": {                 # ground-truth numbers, not read off pixels
     "vwap_at_entry": 231.02,
     "ema9_at_entry": 230.88,
@@ -90,8 +91,9 @@ Returns:
     "support": [ { "price": 228.40, "touches": 3 }, ... ],   # a fallback/
     "resistance": [ { "price": 235.90, "touches": 2 }, ... ] # sanity check
   },
-  "image_base64": "..."             # daily candlestick+volume PNG, in case
-                                     # a caller wants a real vision read
+  "image_base64": None               # daily candlestick+volume PNG rendering is off
+                                      # by default (see include_image below) -- null
+                                      # unless a caller opts in
 }
 
 This endpoint is never called by the automatic daily pipeline -- it only
@@ -1138,12 +1140,14 @@ def _build_chart_response(body, start):
     # own interactive chart from bars/indicators (report.js and trade.js
     # both prefer the interactive one and only fall back to chart_image
     # when it's missing -- see Build Backtest Callback Body's comment).
-    # Callers that only want bars/indicators (the backtest journal send)
-    # can pass include_image: false to skip matplotlib rendering entirely:
-    # it's real CPU time under the global RENDER_LOCK, and skipping it for
-    # a dozen-plus backtest trades also means less contention with the
-    # live pipeline's own chart renders happening around the same time.
-    if body.get("include_image", True):
+    # Nothing in this service actually sends the image to an LLM -- the
+    # Gemini verdict (daily_sync._get_verdict) and the S/R read
+    # (generate-daily-chart, below) both already work off a text summary
+    # of the indicators/bars, never pixels. So matplotlib rendering is OFF
+    # BY DEFAULT: it's real CPU time under the global RENDER_LOCK for a PNG
+    # nothing currently displays or sends anywhere. A caller can still opt
+    # in with include_image: true if something new needs it.
+    if body.get("include_image", False):
         png_bytes = render_chart(
             display_bars, symbol, entry_dt, exit_dt, entry_price, exit_price,
             vwap_at_entry=float(at_entry["VWAP"]),
@@ -1252,7 +1256,11 @@ def _build_daily_chart_response(body: dict) -> dict:
         raise ValueError(f"No prior daily bars found for {symbol} before {trade_date} -- check the ticker and lookback_days")
 
     levels = _find_pivot_levels(daily)
-    png_bytes = render_daily_chart(daily, symbol, levels) if body.get("include_image", True) else None
+    # Off by default, same reasoning as _build_chart_response above -- the
+    # S/R read sends Gemini a text summary of the daily bars, never this
+    # image, and the frontend draws the returned levels on its own
+    # interactive chart. Pass include_image: true to opt back in.
+    png_bytes = render_daily_chart(daily, symbol, levels) if body.get("include_image", False) else None
 
     bars = [
         {"t": ts.strftime("%Y-%m-%d"), "o": round(float(r["Open"]), 4), "h": round(float(r["High"]), 4),
@@ -1397,18 +1405,15 @@ import uuid
 import re
 from engine import BacktestConfig, run_backtest, compute_stats, BacktestCancelled
 from orb_strategy import DEFAULT_PARAMS as ORB_DEFAULT_PARAMS
+import backtest_storage
 
-BACKTEST_HISTORY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_history.json")
-BACKTEST_HISTORY_MAX = 100  # keep the file from growing forever
-
-# Full per-run reports (every trade + full stats incl. equity curve) live
-# here, one JSON file per job -- kept separate from backtest_history.json
-# so the Past Runs list stays a light read even after months of runs, while
-# the full report behind any one card can still be pulled up in full at any
-# time via GET /backtest/history/<job_id>/report.
-BACKTEST_REPORTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_reports")
-os.makedirs(BACKTEST_REPORTS_DIR, exist_ok=True)
-_JOB_ID_RE = re.compile(r"^[0-9a-fA-F]+$")  # job ids are uuid4().hex[:12] -- reject anything else before touching the filesystem
+# Backtest history/reports used to live in backtest_history.json /
+# backtest_reports/<job_id>.json on local disk -- moved into Supabase
+# (see backtest_storage.py) since Render's disk is ephemeral and this is
+# real user-facing history, not throwaway job-progress state. Kept
+# shared/anonymous, matching prior behavior (see backtest_storage.py's
+# docstring for why).
+_JOB_ID_RE = re.compile(r"^[0-9a-fA-F]+$")  # job ids are uuid4().hex[:12] -- reject anything else before touching Supabase
 
 _backtest_jobs = {}
 _backtest_jobs_lock = threading.Lock()
@@ -1421,56 +1426,22 @@ def _add_cors_headers(resp):
     # no-op for server-to-server ones, so it's safe to apply to every route.
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, ngrok-skip-browser-warning"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, ngrok-skip-browser-warning"
     return resp
 
 
-def _backtest_history_load():
-    if not os.path.exists(BACKTEST_HISTORY_PATH):
-        return []
-    try:
-        with open(BACKTEST_HISTORY_PATH) as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return []
-
-
-def _backtest_history_save(entries):
-    with open(BACKTEST_HISTORY_PATH, "w") as f:
-        json.dump(entries[:BACKTEST_HISTORY_MAX], f, indent=2)
-
-
-def _backtest_report_path(job_id):
-    return os.path.join(BACKTEST_REPORTS_DIR, f"{job_id}.json")
-
-
-def _backtest_report_save(job_id, report):
-    with open(_backtest_report_path(job_id), "w") as f:
-        json.dump(report, f, indent=2)
-
-
 def _backtest_report_load(job_id):
+    # job ids are always uuid4().hex[:12] -- reject anything else before
+    # it goes anywhere near a query, same guard the old file path had.
     if not _JOB_ID_RE.match(job_id or ""):
         return None
-    path = _backtest_report_path(job_id)
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return None
+    return backtest_storage.load_backtest_report(job_id)
 
 
 def _backtest_report_delete(job_id):
     if not _JOB_ID_RE.match(job_id or ""):
         return
-    path = _backtest_report_path(job_id)
-    if os.path.exists(path):
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+    backtest_storage.delete_backtest_run(job_id)
 
 
 def _run_backtest_job(job_id: str, cfg: BacktestConfig, meta: dict):
@@ -1506,37 +1477,33 @@ def _run_backtest_job(job_id: str, cfg: BacktestConfig, meta: dict):
             _backtest_jobs[job_id]["stats"] = stats
             _backtest_jobs[job_id]["trades"] = trades
 
-        entries = _backtest_history_load()
         created_at = datetime.now().isoformat(timespec="seconds")
-        entries.insert(0, {
-            "id": job_id,
-            "created_at": created_at,
-            "label": meta.get("label") or "(untitled run)",
-            "params": meta,
-            "stats": {
-                "num_trades": stats["num_trades"],
-                "win_rate": stats["win_rate"],
-                "profit_factor": stats["profit_factor"],
-                "net_pnl_dollars": stats["net_pnl_dollars"],
-                "avg_r": stats["avg_r"],
-                "max_drawdown_dollars": stats["max_drawdown_dollars"],
-                "total_commissions_dollars": stats.get("total_commissions_dollars", 0.0),
-            },
-        })
-        _backtest_history_save(entries)
-
-        # Full report -- every trade plus the full stats block (equity
-        # curve included) -- so the report can be reopened in full later,
-        # not just re-run from its saved params. See GET
-        # /backtest/history/<job_id>/report.
-        _backtest_report_save(job_id, {
-            "id": job_id,
-            "created_at": created_at,
-            "label": meta.get("label") or "(untitled run)",
-            "params": meta,
-            "stats": stats,
-            "trades": trades,
-        })
+        label = meta.get("label") or "(untitled run)"
+        summary_stats = {
+            "num_trades": stats["num_trades"],
+            "win_rate": stats["win_rate"],
+            "profit_factor": stats["profit_factor"],
+            "net_pnl_dollars": stats["net_pnl_dollars"],
+            "avg_r": stats["avg_r"],
+            "max_drawdown_dollars": stats["max_drawdown_dollars"],
+            "total_commissions_dollars": stats.get("total_commissions_dollars", 0.0),
+        }
+        # One upsert covers both the Past Runs list (summary_stats) and the
+        # full report (every trade, full stats incl. equity curve) -- see
+        # GET /backtest/history/<job_id>/report for the latter.
+        try:
+            backtest_storage.save_backtest_run(
+                job_id, created_at, label, meta, summary_stats,
+                report={
+                    "id": job_id, "created_at": created_at, "label": label,
+                    "params": meta, "stats": stats, "trades": trades,
+                },
+            )
+        except Exception:
+            # Don't let a Supabase hiccup lose the run entirely -- it's
+            # still sitting in _backtest_jobs and pollable/downloadable
+            # until this process restarts, just won't show up in Past Runs.
+            log.exception("Backtest job %s: failed to persist to Supabase", job_id)
     except BacktestCancelled:
         log.info("Backtest job %s cancelled by user", job_id)
         with _backtest_jobs_lock:
@@ -1678,7 +1645,7 @@ def backtest_cancel(job_id):
 
 @app.route("/backtest/history", methods=["GET"])
 def backtest_history():
-    return jsonify(_backtest_history_load())
+    return jsonify(backtest_storage.load_backtest_history())
 
 
 @app.route("/backtest/history/<job_id>/report", methods=["GET"])
@@ -1765,7 +1732,7 @@ def backtest_history_enrich(job_id):
     if matched_but_empty:
         log.warning("Enrich %s: matched but bars came through empty/missing for: %s", job_id, matched_but_empty)
 
-    _backtest_report_save(job_id, report)
+    backtest_storage.save_backtest_report(job_id, report)
     return jsonify({"matched": len(matched_keys), "unmatched": len(by_key) - len(matched_keys), "matched_but_empty": len(matched_but_empty)})
 
 
@@ -1773,8 +1740,10 @@ def backtest_history_enrich(job_id):
 def backtest_history_delete(job_id):
     if request.method == "OPTIONS":
         return "", 204
-    entries = [e for e in _backtest_history_load() if e["id"] != job_id]
-    _backtest_history_save(entries)
+    # One row covers both the history-list entry and the full report now,
+    # so deleting it removes both in a single call (used to be a
+    # load-all/filter/save-all on the history file plus a separate report
+    # file delete).
     _backtest_report_delete(job_id)
     with _backtest_jobs_lock:
         _backtest_jobs.pop(job_id, None)
@@ -1784,3 +1753,15 @@ def backtest_history_delete(job_id):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001, threaded=True)
+
+from ai_routes import bp as ai_bp
+app.register_blueprint(ai_bp)
+
+from import_routes import bp as import_bp
+app.register_blueprint(import_bp)
+
+from backtest_import_routes import bp as backtest_import_bp
+app.register_blueprint(backtest_import_bp)
+
+from daily_sync import bp as daily_sync_bp
+app.register_blueprint(daily_sync_bp)
