@@ -1717,6 +1717,18 @@ def backtest_history_enrich(job_id):
         for field in ENRICH_FIELDS:
             if field in src:
                 t[field] = src[field]
+        if "lessons" in src:
+            # This callback's lessons come straight from n8n's own
+            # Gemini call (backtester.js's "Send to Journal"), not
+            # through daily_sync.py's normal per-fill pipeline, so they
+            # never pass through _normalize_lessons there. Without this,
+            # a double-encoded lesson (a JSON string instead of a real
+            # object -- see _normalize_lessons's docstring) lands in
+            # this run's saved report as-is and every consumer
+            # (trade.js/quiz.js/rewind.js/share-export.js) prints it as
+            # raw JSON text instead of the fields inside it.
+            from daily_sync import _normalize_lessons
+            t["lessons"] = _normalize_lessons(src["lessons"])
         matched_keys.add(key_of(t))
         if not (isinstance(t.get("bars"), list) and t["bars"]):
             matched_but_empty.append(key_of(t))
@@ -1751,9 +1763,6 @@ def backtest_history_delete(job_id):
 
 
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001, threaded=True)
-
 from ai_routes import bp as ai_bp
 app.register_blueprint(ai_bp)
 
@@ -1765,3 +1774,6 @@ app.register_blueprint(backtest_import_bp)
 
 from daily_sync import bp as daily_sync_bp
 app.register_blueprint(daily_sync_bp)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5001, threaded=True)
