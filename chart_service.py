@@ -1406,14 +1406,30 @@ import re
 from engine import BacktestConfig, run_backtest, compute_stats, BacktestCancelled
 from orb_strategy import DEFAULT_PARAMS as ORB_DEFAULT_PARAMS
 import backtest_storage
+from supabase_auth import resolve_user_id
 
 # Backtest history/reports used to live in backtest_history.json /
 # backtest_reports/<job_id>.json on local disk -- moved into Supabase
 # (see backtest_storage.py) since Render's disk is ephemeral and this is
-# real user-facing history, not throwaway job-progress state. Kept
-# shared/anonymous, matching prior behavior (see backtest_storage.py's
-# docstring for why).
+# real user-facing history, not throwaway job-progress state. Scoped
+# per-account via resolve_user_id (same pattern /import-trades uses) --
+# see backtest_storage.py's docstring for the full story on why this used
+# to be shared/anonymous and isn't anymore.
 _JOB_ID_RE = re.compile(r"^[0-9a-fA-F]+$")  # job ids are uuid4().hex[:12] -- reject anything else before touching Supabase
+
+
+def _require_user():
+    """Resolves the calling user from the Authorization header. Returns
+    (user_id, None) on success, or (None, (response, status)) to return
+    straight from the route on failure -- so every /backtest/* route below
+    starts with:
+        user_id, err = _require_user()
+        if err: return err
+    """
+    user_id = resolve_user_id(request.headers.get("Authorization"))
+    if not user_id:
+        return None, (jsonify({"error": "missing or invalid Authorization token -- please log in and try again"}), 401)
+    return user_id, None
 
 _backtest_jobs = {}
 _backtest_jobs_lock = threading.Lock()
@@ -1430,21 +1446,21 @@ def _add_cors_headers(resp):
     return resp
 
 
-def _backtest_report_load(job_id):
+def _backtest_report_load(job_id, user_id):
     # job ids are always uuid4().hex[:12] -- reject anything else before
     # it goes anywhere near a query, same guard the old file path had.
     if not _JOB_ID_RE.match(job_id or ""):
         return None
-    return backtest_storage.load_backtest_report(job_id)
+    return backtest_storage.load_backtest_report(job_id, user_id)
 
 
-def _backtest_report_delete(job_id):
+def _backtest_report_delete(job_id, user_id):
     if not _JOB_ID_RE.match(job_id or ""):
         return
-    backtest_storage.delete_backtest_run(job_id)
+    backtest_storage.delete_backtest_run(job_id, user_id)
 
 
-def _run_backtest_job(job_id: str, cfg: BacktestConfig, meta: dict):
+def _run_backtest_job(job_id: str, user_id: str, cfg: BacktestConfig, meta: dict):
     def progress(i, total, d, trades_so_far=None):
         with _backtest_jobs_lock:
             job = _backtest_jobs.get(job_id)
@@ -1493,7 +1509,7 @@ def _run_backtest_job(job_id: str, cfg: BacktestConfig, meta: dict):
         # GET /backtest/history/<job_id>/report for the latter.
         try:
             backtest_storage.save_backtest_run(
-                job_id, created_at, label, meta, summary_stats,
+                job_id, user_id, created_at, label, meta, summary_stats,
                 report={
                     "id": job_id, "created_at": created_at, "label": label,
                     "params": meta, "stats": stats, "trades": trades,
@@ -1540,6 +1556,10 @@ def backtest_defaults():
 def backtest_start():
     if request.method == "OPTIONS":
         return "", 204
+
+    user_id, err = _require_user()
+    if err:
+        return err
 
     body = request.get_json(force=True, silent=True) or {}
 
@@ -1608,20 +1628,27 @@ def backtest_start():
         _backtest_jobs[job_id] = {
             "status": "running", "current": 0, "total": 0, "day": None,
             "trades": [], "stats": None, "cancel_requested": False,
+            "user_id": user_id,  # not serialized out -- see backtest_status, which strips it before responding
         }
 
-    t = threading.Thread(target=_run_backtest_job, args=(job_id, cfg, body), daemon=True)
+    t = threading.Thread(target=_run_backtest_job, args=(job_id, user_id, cfg, body), daemon=True)
     t.start()
     return jsonify({"job_id": job_id})
 
 
 @app.route("/backtest/status/<job_id>", methods=["GET"])
 def backtest_status(job_id):
+    user_id, err = _require_user()
+    if err:
+        return err
     with _backtest_jobs_lock:
         job = _backtest_jobs.get(job_id)
-    if job is None:
+    # Someone else's job_id (or an unknown one) looks identical to a
+    # missing job -- don't distinguish "exists but isn't yours" from
+    # "never existed".
+    if job is None or job.get("user_id") != user_id:
         return jsonify({"status": "unknown"}), 404
-    return jsonify(job)
+    return jsonify({k: v for k, v in job.items() if k != "user_id"})
 
 
 @app.route("/backtest/cancel/<job_id>", methods=["POST", "OPTIONS"])
@@ -1633,9 +1660,12 @@ def backtest_cancel(job_id):
     # job as a partial report -- see backtest_status.
     if request.method == "OPTIONS":
         return "", 204
+    user_id, err = _require_user()
+    if err:
+        return err
     with _backtest_jobs_lock:
         job = _backtest_jobs.get(job_id)
-        if job is None:
+        if job is None or job.get("user_id") != user_id:
             return jsonify({"error": "unknown job"}), 404
         if job["status"] != "running":
             return jsonify({"status": job["status"]})
@@ -1645,7 +1675,10 @@ def backtest_cancel(job_id):
 
 @app.route("/backtest/history", methods=["GET"])
 def backtest_history():
-    return jsonify(backtest_storage.load_backtest_history())
+    user_id, err = _require_user()
+    if err:
+        return err
+    return jsonify(backtest_storage.load_backtest_history(user_id))
 
 
 @app.route("/backtest/history/<job_id>/report", methods=["GET"])
@@ -1655,10 +1688,14 @@ def backtest_history_report(job_id):
     # _run_backtest_job) and readable here at any point after, independent
     # of the in-memory _backtest_jobs dict, which is lost on a server
     # restart. This is what lets a Past Runs card reopen the actual report
-    # instead of only re-running the same params.
-    report = _backtest_report_load(job_id)
+    # instead of only re-running the same params. Scoped to the caller's
+    # own runs -- see _backtest_report_load / backtest_storage.load_backtest_report.
+    user_id, err = _require_user()
+    if err:
+        return err
+    report = _backtest_report_load(job_id, user_id)
     if report is None:
-        return jsonify({"error": "no saved report for this run (may predate this feature, or the run didn't finish)"}), 404
+        return jsonify({"error": "no saved report for this run (may predate this feature, may not be yours, or the run didn't finish)"}), 404
     return jsonify(report)
 
 
@@ -1692,7 +1729,13 @@ def backtest_history_enrich(job_id):
     if request.method == "OPTIONS":
         return "", 204
 
-    report = _backtest_report_load(job_id)
+    # Deliberately unauthenticated (unlike the other /backtest/history/*
+    # routes): the caller here is n8n's server-to-server workflow, not the
+    # logged-in person's browser, so there's no Supabase access token to
+    # check -- see backtest_storage.save_backtest_report's docstring.
+    if not _JOB_ID_RE.match(job_id or ""):
+        return jsonify({"error": "no saved report for this run"}), 404
+    report = backtest_storage.load_backtest_report_unscoped(job_id)
     if report is None:
         return jsonify({"error": "no saved report for this run"}), 404
 
@@ -1752,13 +1795,19 @@ def backtest_history_enrich(job_id):
 def backtest_history_delete(job_id):
     if request.method == "OPTIONS":
         return "", 204
+    user_id, err = _require_user()
+    if err:
+        return err
     # One row covers both the history-list entry and the full report now,
     # so deleting it removes both in a single call (used to be a
     # load-all/filter/save-all on the history file plus a separate report
-    # file delete).
-    _backtest_report_delete(job_id)
+    # file delete). Scoped to the caller's own runs -- someone else's
+    # job_id matches zero rows and is a silent no-op, not an error.
+    _backtest_report_delete(job_id, user_id)
     with _backtest_jobs_lock:
-        _backtest_jobs.pop(job_id, None)
+        job = _backtest_jobs.get(job_id)
+        if job and job.get("user_id") == user_id:
+            _backtest_jobs.pop(job_id, None)
     return jsonify({"deleted": job_id})
 
 
