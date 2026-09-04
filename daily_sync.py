@@ -238,6 +238,50 @@ def request_flex_statement(account: dict) -> dict:
 # Per-trade: chart -> indicator summary -> Gemini verdict -> final chart
 # ---------------------------------------------------------------------------
 
+# Cap how many bar rows we ever hand to the model -- a normal
+# scalp/day-trade display window is well under this, but a very long
+# hold shouldn't blow up the prompt.
+_MAX_BAR_ROWS_FOR_PROMPT = 200
+
+
+def _bar_table_for_prompt(chart: dict | None) -> str:
+    """Render the display-window bars as a compact time/low/high/close
+    table so the model has real, addressable price levels to anchor
+    better_entry_time/better_entry_price (and the exit equivalents) to,
+    instead of inventing a time and a price as two independent guesses.
+    Without this, the model has no way to know what price the stock
+    actually traded at away from the single entry-time snapshot above --
+    so a "better entry 10 minutes earlier" is pure hallucination for both
+    when and at what price, and the two guesses routinely disagree with
+    what really happened on the tape (a price that no bar that day ever
+    reached, at a time that doesn't line up with it either). That's what
+    shows up on the trade page as a better-entry/exit marker floating in
+    empty space, disconnected from every candle.
+    """
+    bars = (chart or {}).get("bars")
+    if not isinstance(bars, list) or not bars:
+        return ""
+    rows = bars[:_MAX_BAR_ROWS_FOR_PROMPT]
+    lines = [
+        "Minute-by-minute bars for this display window (time, low, high, "
+        "close) -- the ONLY price levels that actually traded. Every "
+        "better_entry_time/better_exit_time you propose MUST be the exact "
+        "timestamp of one of these bars, and the matching "
+        "better_entry_price/better_exit_price MUST fall within that bar's "
+        "low-high range (inclusive) -- never a price or time this table "
+        "doesn't support:",
+    ]
+    for b in rows:
+        t = b.get("t")
+        l, h, c = b.get("l"), b.get("h"), b.get("c")
+        if t is None or l is None or h is None or c is None:
+            continue
+        lines.append(f"- {t}: low ${l:.2f}, high ${h:.2f}, close ${c:.2f}")
+    if len(bars) > _MAX_BAR_ROWS_FOR_PROMPT:
+        lines.append(f"... ({len(bars) - _MAX_BAR_ROWS_FOR_PROMPT} more bars omitted for length)")
+    return "\n".join(lines)
+
+
 def _indicator_summary(chart: dict | None) -> str:
     """Port of 'Summarize Indicators For Verdict'."""
     indicators = (chart or {}).get("indicators")
@@ -250,7 +294,7 @@ def _indicator_summary(chart: dict | None) -> str:
     def fmt(n, decimals=2):
         return f"{n:.{decimals}f}" if isinstance(n, (int, float)) else "n/a"
 
-    return "\n".join([
+    summary = "\n".join([
         "Indicators at entry (ground-truth from the chart service, not read off a chart image):",
         f"- VWAP: ${fmt(indicators.get('vwap_at_entry'))} (entry is {indicators.get('entry_vs_vwap', 'n/a')} VWAP)",
         f"- EMA9: ${fmt(indicators.get('ema9_at_entry'))} (entry is {indicators.get('entry_vs_ema9', 'n/a')} EMA9)",
@@ -262,6 +306,8 @@ def _indicator_summary(chart: dict | None) -> str:
         f"(R multiple: {fmt(indicators.get('r_multiple'), 2)})",
         f"- Display window price range: ${fmt(indicators.get('display_price_low'))} - ${fmt(indicators.get('display_price_high'))}",
     ])
+    bar_table = _bar_table_for_prompt(chart)
+    return f"{summary}\n\n{bar_table}" if bar_table else summary
 
 
 def _build_verdict_prompt(trade: dict, indicator_summary: str) -> str:
@@ -296,7 +342,12 @@ def _build_verdict_prompt(trade: dict, indicator_summary: str) -> str:
         "close to optimal, propose the tightest defensible alternative instead (the exact "
         "VWAP/EMA9 tick, the prior 1-minute candle's high or low, or the specific bar where the "
         "reclaim/breakout first confirmed) and say in one sentence why it's marginally better "
-        "(less slippage, earlier confirmation, avoided giving back some of the gain, etc.). Every "
+        "(less slippage, earlier confirmation, avoided giving back some of the gain, etc.). "
+        "better_entry_time and better_exit_time MUST each be copied EXACTLY from one of the "
+        "timestamps in the minute-bar table above -- never a rounded, invented, or approximate "
+        "time -- and better_entry_price/better_exit_price MUST fall within that same bar's "
+        "low-high range. Do not propose a price that no bar in the table actually reached, even "
+        "if it looks like a plausible round number. Every "
         "better_entry_reason and better_exit_reason must cite a specific number from the "
         "indicator_summary or the trade's own price/time data above -- never a generic line like "
         "\"entry could have been earlier\" with no number attached.\n\n"
