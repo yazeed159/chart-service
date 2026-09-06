@@ -149,7 +149,18 @@ def support_resistance():
     try:
         gem = _call_gemini({
             "contents": [{"parts": [{"text": prompt_text}]}],
-            "generationConfig": {"response_mime_type": "application/json"},
+            "generationConfig": {
+                "response_mime_type": "application/json",
+                # Same reasoning as daily_sync.py's verdict call: this
+                # never set thinkingConfig before, so it was running at
+                # this model's default thinking level (documented as the
+                # highest tier for Gemini 3 Flash unless told otherwise)
+                # for what's a fairly bounded pivot-level read. "minimal"
+                # is the lowest tier available. The fallback to
+                # computed_levels below already covers a malformed/failed
+                # response, so this is a low-risk place to try it.
+                "thinkingConfig": {"thinkingLevel": "minimal"},
+            },
         }, timeout=SR_TIMEOUT_S)
         text = _extract_text(gem)
         parsed = json.loads(text) if text else None
@@ -256,7 +267,15 @@ def trade_chat():
             "generationConfig": {
                 "temperature": 0.4,
                 "maxOutputTokens": 2048,
-                "thinkingConfig": {"thinkingLevel": "low"},
+                # "minimal" is the lowest tier Gemini 3 models expose --
+                # there's no true "off" (thinkingLevel only accepts
+                # minimal/low/medium/high; "none" is rejected outright).
+                # Google's own docs describe "minimal" as matching "no
+                # thinking" for most queries, which is what this route
+                # wants: a conversational reply, not multi-step reasoning.
+                # Dropped from "low" since that was adding real wall-clock
+                # latency to every chat message for no visible benefit.
+                "thinkingConfig": {"thinkingLevel": "minimal"},
             },
         }, timeout=CHAT_TIMEOUT_S)
         reply = _extract_text(gem)
@@ -357,7 +376,20 @@ def backtest_ai():
             "generationConfig": {
                 "temperature": 0.3,
                 "maxOutputTokens": 1024,
-                "thinkingConfig": {"thinkingLevel": "low"},
+                # Dropped from "low" to "minimal" (the lowest tier Gemini 3
+                # models expose -- there's no true "off") for less
+                # wall-clock latency on what's meant to be a snappy
+                # back-and-forth. Deliberately NOT also re-enabling forced
+                # JSON mode here even though "minimal" thinking makes that
+                # combination less likely to time out than "low" did --
+                # the comment below (and the n8n node before this) already
+                # found that pairing unreliable against this model, and
+                # that's not something to gamble back on without being able
+                # to load-test it live. The regex-based fence-stripping
+                # below is the known-working path; revisit forced JSON only
+                # after confirming minimal-thinking + response_mime_type
+                # actually holds up under real traffic.
+                "thinkingConfig": {"thinkingLevel": "minimal"},
             },
         }, timeout=BACKTEST_AI_TIMEOUT_S)
         raw = _extract_text(gem)

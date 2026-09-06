@@ -79,6 +79,7 @@ from flask import Blueprint, jsonify
 from flex_xml import parse_flex_xml
 from trade_matching import fifo_match_and_merge, parse_flex_executions
 from publish import publish_trades
+import symbol_info_store
 
 log = logging.getLogger("chart_service.daily_sync")
 bp = Blueprint("daily_sync", __name__)
@@ -310,14 +311,30 @@ def _indicator_summary(chart: dict | None) -> str:
     return f"{summary}\n\n{bar_table}" if bar_table else summary
 
 
-def _build_verdict_prompt(trade: dict, indicator_summary: str) -> str:
-    """Faithful port of "Vision LLM Analysis"'s prompt text."""
+def _build_verdict_prompt(trade: dict, indicator_summary: str, need_symbol_info: bool = True) -> str:
+    """Faithful port of "Vision LLM Analysis"'s prompt text.
+
+    need_symbol_info=False drops the symbol_name/symbol_country/
+    symbol_sector/symbol_description fields from the requested JSON
+    shape entirely -- used once a symbol's company info is already on
+    file (see symbol_info_store.py + process_trade below), since asking
+    Gemini to regenerate the same four facts on every trade of an
+    already-known symbol was pure repeated prompt/output for no new
+    information. First-ever trade on a symbol still asks for them here,
+    same call, no extra round trip."""
     symbol = trade.get("Symbol")
     side = trade.get("Side") or "Long"
     entry_price = trade.get("Entry Price")
     entry_time = trade.get("Entry Time")
     exit_price = trade.get("Exit Price")
     exit_time = trade.get("Exit Time")
+    symbol_info_schema = (
+        ", \"symbol_name\": string (the "
+        "company/asset full name), \"symbol_country\": string (country the company is "
+        "headquartered or listed in), \"symbol_sector\": string (industry/sector), "
+        "\"symbol_description\": string (2-3 sentences on what the company actually does)"
+        if need_symbol_info else ""
+    )
     return (
         "You are grading this trade against a momentum day-trading playbook modeled on Ross "
         "Cameron's (Warrior Trading) rules: the two entries that count are a DIP BUY (a pullback "
@@ -396,10 +413,8 @@ def _build_verdict_prompt(trade: dict, indicator_summary: str) -> str:
         "that lesson, and each \"tag\" a short snake_case category picked from (or, if truly none "
         "fit, coined in the same style as) this set: chased_extension, late_entry, late_exit, "
         "ignored_volume, no_stop_discipline, sized_too_big, held_through_reversal, "
-        "entered_against_trend, exited_too_early, good_execution, \"symbol_name\": string (the "
-        "company/asset full name), \"symbol_country\": string (country the company is "
-        "headquartered or listed in), \"symbol_sector\": string (industry/sector), "
-        "\"symbol_description\": string (2-3 sentences on what the company actually does)}"
+        "entered_against_trend, exited_too_early, good_execution"
+        f"{symbol_info_schema}}}"
     )
 
 
@@ -441,16 +456,41 @@ def _normalize_lessons(raw) -> list:
     return out
 
 
-def _get_verdict(trade: dict, indicator_summary: str) -> dict:
+def _get_verdict(trade: dict, indicator_summary: str, cached_symbol_info: dict | None = None) -> dict:
     """Calls Gemini and parses the verdict JSON, mirrors "Parse Verdict &
-    Attach Chart"'s try/except-to-llm_parse_error behavior exactly."""
+    Attach Chart"'s try/except-to-llm_parse_error behavior exactly.
+
+    cached_symbol_info (see symbol_info_store.py) is this symbol's
+    already-known name/country/sector/description, if any. When present,
+    the prompt skips asking Gemini for those four fields at all (see
+    _build_verdict_prompt's need_symbol_info) and they're merged onto the
+    verdict here instead of round-tripping through the model again. When
+    absent (first time this symbol's been graded), the same call still
+    asks for them as before, and a non-empty answer gets saved to
+    symbol_info_store so trade 2 of this symbol skips asking."""
     from ai_routes import _call_gemini, _extract_text  # lazy, same pattern as everywhere else in this service
 
-    prompt = _build_verdict_prompt(trade, indicator_summary)
+    need_symbol_info = cached_symbol_info is None
+    prompt = _build_verdict_prompt(trade, indicator_summary, need_symbol_info)
     try:
         gem = _call_gemini({
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"response_mime_type": "application/json"},
+            "generationConfig": {
+                "response_mime_type": "application/json",
+                # This call never set thinkingConfig before, which for a
+                # Gemini 3-family model means it was running at whatever
+                # that model's *default* thinking level is -- documented
+                # as the highest tier for Gemini 3 Flash unless told
+                # otherwise. "minimal" is the lowest tier available
+                # (there's no true "off") and is meant to match "no
+                # thinking" for most queries -- worth confirming against
+                # real logs after this ships, but the existing
+                # try/except above already falls back gracefully to
+                # _VERDICT_PARSE_ERROR_FALLBACK if a call ever comes back
+                # malformed, so the blast radius of this being wrong is
+                # small.
+                "thinkingConfig": {"thinkingLevel": "minimal"},
+            },
         }, timeout=GEMINI_TIMEOUT_S)
         text = _extract_text(gem)
         verdict = json.loads(text)
@@ -461,6 +501,25 @@ def _get_verdict(trade: dict, indicator_summary: str) -> dict:
         verdict = dict(_VERDICT_PARSE_ERROR_FALLBACK)
         verdict["reasoning"] = f"Could not parse Gemini response: {e}"
     verdict["lessons"] = _normalize_lessons(verdict.get("lessons"))
+
+    if cached_symbol_info is not None:
+        verdict["symbol_name"] = cached_symbol_info.get("name") or ""
+        verdict["symbol_country"] = cached_symbol_info.get("country") or ""
+        verdict["symbol_sector"] = cached_symbol_info.get("sector") or ""
+        verdict["symbol_description"] = cached_symbol_info.get("description") or ""
+    elif any(verdict.get(k) for k in ("symbol_name", "symbol_country", "symbol_sector", "symbol_description")):
+        try:
+            symbol_info_store.save_symbol_info(
+                trade.get("Symbol"),
+                verdict.get("symbol_name") or "", verdict.get("symbol_country") or "",
+                verdict.get("symbol_sector") or "", verdict.get("symbol_description") or "",
+            )
+        except Exception as e:
+            # Non-fatal: worst case this symbol just asks Gemini for its
+            # info again on its next trade instead of being served from
+            # the table.
+            log.warning("symbol_info_store save failed for %s (non-fatal): %s", trade.get("Symbol"), e)
+
     return verdict
 
 
@@ -525,7 +584,14 @@ def process_trade(trade: dict) -> dict:
         log.error("Generate Chart failed for %s %s: %s", symbol, trade_date, e)
 
     summary = _indicator_summary(chart)
-    verdict = _get_verdict(trade, summary)
+    try:
+        cached_symbol_info = symbol_info_store.get_symbol_info(symbol)
+    except Exception as e:
+        # Non-fatal: worst case this trade's verdict call just asks
+        # Gemini for the symbol's info again instead of skipping it.
+        log.warning("symbol_info_store lookup failed for %s (non-fatal): %s", symbol, e)
+        cached_symbol_info = None
+    verdict = _get_verdict(trade, summary, cached_symbol_info)
     trade = _apply_verdict(trade, verdict)
 
     final_chart = None

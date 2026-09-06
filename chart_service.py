@@ -61,17 +61,33 @@ indicators also now carries (best-effort -- see VOLUME_FLOAT_STATS below):
   "avg_volume_30d": 2140335.2,      # mean daily volume over the ~30 trading
                                      # days strictly before trade_date
   "relative_volume": 3.84,          # volume_on_entry_day / avg_volume_30d
-  "float_shares": 18500000,         # share_class_shares_outstanding from
-                                     # Polygon's ticker reference data -- a
-                                     # commonly-used float PROXY, not an
-                                     # exact tradable-float figure
+  "float_shares": None,             # always null out of /generate-chart now --
+                                     # float is no longer fetched automatically
+                                     # per trade (see POST /fetch-float below)
   "avg_volume_tag": "avgvol_1m_5m", # bucketed tags, see classify_* below --
   "rvol_tag": "rvol_2x_5x",         # these are what the publish step copies
-  "float_tag": "float_low_10m_20m"  # onto data/trades.json for journal filters
+  "float_tag": "float_unknown"      # onto data/trades.json for journal filters --
+                                     # stays "float_unknown" until /fetch-float
+                                     # is called for this trade
 
-Any of the four volume_float fields/tags can be null if Polygon's ticker
-reference/daily-aggs calls fail or the plan doesn't include them -- this
-never fails the whole /generate-chart call.
+Any of the volume/avg_volume/rvol fields/tags can be null if Polygon's
+daily-aggs calls fail or the plan doesn't include them -- this never fails
+the whole /generate-chart call.
+
+POST /fetch-float
+{
+  "trade_id": "AAPL-20260812-095948",
+  "symbol": "AAPL"
+}
+On-demand float lookup, requires an Authorization: Bearer <supabase JWT>
+header. Hits Polygon's ticker reference endpoint (share_class_shares_
+outstanding, a commonly-used float PROXY, not an exact tradable-float
+figure -- same field /generate-chart used to fetch automatically), but
+only when the user asks for THIS symbol by clicking "Get float" on the
+trade detail page, and only ever once per symbol overall (see
+float_shares_store.py). Also merges the result into that trade's stored
+indicators/float_tag in Supabase so it's there next time the trade is
+opened. Returns {"float_shares": 18500000, "float_tag": "float_low_10m_20m"}.
 
 POST /generate-daily-chart
 {
@@ -101,6 +117,30 @@ exists for the trade site's optional "Support & Resistance (AI)" button, so
 reviewing a trade never spends an extra Polygon/LLM call unless you
 explicitly ask for one.
 
+POST /full-day-bars
+{
+  "symbol": "AAPL",
+  "trade_date": "2026-08-12"
+}
+
+Returns:
+{
+  "symbol": "AAPL",
+  "trade_date": "2026-08-12",
+  "bars": [ ... ]              # same per-bar shape as /generate-chart's
+                                # "bars", but for the WHOLE session that
+                                # day (pre-market through after-hours),
+                                # not just the narrow entry/exit window
+}
+
+On-demand only -- the trade/practice/rewind pages' "Show full day" control
+calls this when someone actually wants more chart context than what got
+stored for a trade. Shares its Polygon fetch + cache with /generate-chart
+(keyed by symbol+trade_date, same as polygon_client.py's cache for the
+backtester), so calling this for a symbol+day already charted today --
+this trade's own chart, a different trade on the same symbol+day, or an
+earlier click of this same button -- is free.
+
 POST /tick-data
 {
   "symbol": "AAPL",
@@ -127,8 +167,8 @@ CORS/rate-limiter/caching treatment as the rest of this file.
 
 Env vars:
   POLYGON_API_KEY          - your Polygon.io API key
-  CHART_WINDOW_BEFORE_MIN  - minutes of context before entry (default 90)
-  CHART_WINDOW_AFTER_MIN   - minutes of context after exit (default 30)
+  CHART_WINDOW_BEFORE_MIN  - minutes of context before entry (default 120)
+  CHART_WINDOW_AFTER_MIN   - minutes of context after exit (default 120)
   CHART_LOOKBACK_DAYS      - calendar days of prior bars fetched purely to
                               warm up EMA/MACD (default 5, not displayed)
   POLYGON_BATCH_SIZE       - Polygon calls allowed per batch before the
@@ -200,8 +240,8 @@ REQUEST_HARD_TIMEOUT_S = 60
 _request_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="chart-req")
 
 POLYGON_API_KEY = os.environ["POLYGON_API_KEY"]
-WINDOW_BEFORE = int(os.environ.get("CHART_WINDOW_BEFORE_MIN", 90))
-WINDOW_AFTER = int(os.environ.get("CHART_WINDOW_AFTER_MIN", 30))
+WINDOW_BEFORE = int(os.environ.get("CHART_WINDOW_BEFORE_MIN", 120))
+WINDOW_AFTER = int(os.environ.get("CHART_WINDOW_AFTER_MIN", 120))
 LOOKBACK_DAYS = int(os.environ.get("CHART_LOOKBACK_DAYS", 5))
 ENABLE_VOLUME_FLOAT_STATS = os.environ.get("ENABLE_VOLUME_FLOAT_STATS", "true").lower() not in ("false", "0", "no")
 VOLUME_STATS_LOOKBACK_DAYS = int(os.environ.get("VOLUME_STATS_LOOKBACK_DAYS", 30))
@@ -223,6 +263,20 @@ POLYGON_BATCH_MIN_GAP_S = float(os.environ.get("POLYGON_BATCH_MIN_GAP_S", 2.0)) 
 
 ET = ZoneInfo("America/New_York")
 SESSION_VWAP_START = dtime(4, 0)  # session VWAP resets here each day — pre-market open, not 9:30 regular open
+REGULAR_SESSION_START = dtime(9, 30)  # regular-hours open — used to line up locally-resampled
+REGULAR_SESSION_END = dtime(16, 0)    # daily bars with what Polygon's own day-aggregate endpoint returns
+
+# compute_volume_float_stats() used to make its own Polygon call for daily
+# bars (a separate /range/1/day request, ~58 calendar days back). That's
+# now derived instead by resampling the 1-minute bars this service already
+# fetches for the chart -- see _resample_daily_from_minute_bars() -- so the
+# minute-bar fetch itself needs to reach back far enough to cover it. Only
+# widen the window when the volume/float stats are actually enabled;
+# otherwise stick to the narrow chart-only lookback.
+def _volume_stats_calendar_lookback_days() -> int:
+    # Same padding compute_volume_float_stats always used: 1.6x the trading-day
+    # lookback plus a week of slack to comfortably absorb weekends/holidays.
+    return int(VOLUME_STATS_LOOKBACK_DAYS * 1.6) + 10
 
 
 class _PolygonBatchLimiter:
@@ -306,6 +360,31 @@ _daily_bars_cache = {}
 _daily_bars_cache_lock = threading.Lock()
 
 
+def _get_cached_raw_bars(symbol: str, trade_date_obj: date) -> pd.DataFrame:
+    """Shared entry point for anything that needs a symbol's raw minute bars
+    for one trading day -- fetch_bars() (below, backs /generate-chart) AND
+    get_full_day_bars() (backs /full-day-bars). Both funnel through this
+    same (symbol, trade_date) cache, so two trades on the same symbol+day --
+    or a trade's normal chart plus a later "show full day" click on it, or
+    that same click on a DIFFERENT trade sharing the symbol+day -- pay for
+    exactly one Polygon call between them. This is the identical
+    cache-by-(symbol, date) tactic polygon_client.py's _bars_cache uses for
+    the backtester, just shared across both entry points here."""
+    cache_key = (symbol, trade_date_obj)
+    with _bars_cache_lock:
+        cached = _bars_cache.get(cache_key)
+    if cached is not None:
+        log.info("Bars cache hit for %s %s -- skipping Polygon call", symbol, trade_date_obj)
+        return cached
+
+    df = _fetch_raw_bars_from_polygon(symbol, trade_date_obj)
+    with _bars_cache_lock:
+        if len(_bars_cache) >= _BARS_CACHE_MAX:
+            _bars_cache.pop(next(iter(_bars_cache)))  # evict oldest (dict insertion order)
+        _bars_cache[cache_key] = df
+    return df
+
+
 def fetch_bars(symbol: str, trade_date: str, entry_dt: datetime, exit_dt: datetime):
     """
     Pull 1-minute bars from Polygon covering [trade_date - LOOKBACK_DAYS, trade_date].
@@ -313,19 +392,7 @@ def fetch_bars(symbol: str, trade_date: str, entry_dt: datetime, exit_dt: dateti
     the chart. Returns (full_df, display_mask).
     """
     trade_date_obj = datetime.strptime(trade_date, "%Y-%m-%d").date()
-    cache_key = (symbol, trade_date_obj)
-
-    with _bars_cache_lock:
-        cached = _bars_cache.get(cache_key)
-    if cached is not None:
-        log.info("Bars cache hit for %s %s -- skipping Polygon call", symbol, trade_date_obj)
-        df = cached
-    else:
-        df = _fetch_raw_bars_from_polygon(symbol, trade_date_obj)
-        with _bars_cache_lock:
-            if len(_bars_cache) >= _BARS_CACHE_MAX:
-                _bars_cache.pop(next(iter(_bars_cache)))  # evict oldest (dict insertion order)
-            _bars_cache[cache_key] = df
+    df = _get_cached_raw_bars(symbol, trade_date_obj)
 
     window_start = entry_dt - timedelta(minutes=WINDOW_BEFORE)
     window_end = exit_dt + timedelta(minutes=WINDOW_AFTER)
@@ -337,8 +404,38 @@ def fetch_bars(symbol: str, trade_date: str, entry_dt: datetime, exit_dt: dateti
     return df, display_mask
 
 
+def get_full_day_bars(symbol: str, trade_date: str) -> pd.DataFrame:
+    """Every bar Polygon has for trade_date itself (pre-market through
+    after-hours), with VWAP/EMA9/EMA20/MACD computed -- this is what backs
+    the trade/practice/rewind pages' "show full day" zoom-out (see
+    /full-day-bars below). Goes through the exact same (symbol, trade_date)
+    cache fetch_bars() uses above, so asking for a symbol+day that's
+    already been charted today -- whether that's this same trade's own
+    /generate-chart call earlier, a second trade on the same symbol+day, or
+    an earlier /full-day-bars click on either -- costs zero extra Polygon
+    calls."""
+    trade_date_obj = datetime.strptime(trade_date, "%Y-%m-%d").date()
+    raw = _get_cached_raw_bars(symbol, trade_date_obj)
+    with_indicators = compute_indicators(raw)
+    session_only = with_indicators[with_indicators.index.date == trade_date_obj]
+    if session_only.empty:
+        raise ValueError(f"No bars found for {symbol} on {trade_date} (holiday/weekend, or check the ticker)")
+    return session_only
+
+
+def _minute_bar_lookback_days() -> int:
+    """How far back the minute-bar fetch reaches. Normally just LOOKBACK_DAYS
+    (EMA/MACD warm-up). When volume/float stats are enabled, widened to cover
+    VOLUME_STATS_LOOKBACK_DAYS as well, so _resample_daily_from_minute_bars()
+    has enough history and compute_volume_float_stats never has to make its
+    own separate Polygon call for daily bars."""
+    if ENABLE_VOLUME_FLOAT_STATS:
+        return max(LOOKBACK_DAYS, _volume_stats_calendar_lookback_days())
+    return LOOKBACK_DAYS
+
+
 def _fetch_raw_bars_from_polygon(symbol: str, trade_date_obj: date) -> pd.DataFrame:
-    fetch_start_date = trade_date_obj - timedelta(days=LOOKBACK_DAYS)
+    fetch_start_date = trade_date_obj - timedelta(days=_minute_bar_lookback_days())
 
     url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/{fetch_start_date}/{trade_date_obj}"
     params = {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": POLYGON_API_KEY}
@@ -493,11 +590,30 @@ def _fetch_float_shares(symbol: str):
     a commonly-used proxy for float in retail scanners. Not the same as a
     precise tradable float (which would need to exclude insider/locked-up
     shares a data vendor like this doesn't expose), so it's presented to the
-    user as an approximation. Returns None on any failure -- this must never
-    break /generate-chart."""
+    user as an approximation. Raises on a genuine live-Polygon failure --
+    callers (currently only POST /fetch-float; this used to also be called
+    from compute_volume_float_stats on every /generate-chart, but no
+    longer is -- see that function's docstring) decide how to handle that.
+
+    Lookup order: in-memory cache (this process) -> symbol_float_shares
+    table in Supabase (persists across restarts/redeploys, shared across
+    every user's journal) -> Polygon, only on a genuine first-ever miss.
+    See float_shares_store.py's docstring for why this makes float a true
+    one-time-per-symbol Polygon call instead of a per-restart one."""
     with _float_cache_lock:
         if symbol in _float_cache:
             return _float_cache[symbol]
+
+    try:
+        stored = float_shares_store.get_float_shares(symbol)
+    except Exception as e:
+        log.warning("float_shares_store lookup failed for %s -- falling back to Polygon: %s", symbol, e)
+        stored = None
+    if stored is not None:
+        shares = stored["shares"]
+        with _float_cache_lock:
+            _float_cache[symbol] = shares
+        return shares
 
     url = f"https://api.polygon.io/v3/reference/tickers/{symbol}"
     params = {"apiKey": POLYGON_API_KEY}
@@ -508,6 +624,13 @@ def _fetch_float_shares(symbol: str):
     results = payload.get("results") or {}
     shares = results.get("share_class_shares_outstanding") or results.get("weighted_shares_outstanding")
     shares = int(shares) if shares else None
+
+    try:
+        float_shares_store.save_float_shares(symbol, shares)
+    except Exception as e:
+        # Non-fatal: worst case, this symbol just costs another live
+        # Polygon call next time instead of being served from the table.
+        log.warning("float_shares_store save failed for %s (non-fatal): %s", symbol, e)
 
     with _float_cache_lock:
         _float_cache[symbol] = shares
@@ -650,14 +773,57 @@ def classify_relative_volume(rvol) -> str:
     return "rvol_10x_plus"
 
 
-def compute_volume_float_stats(symbol: str, trade_date_obj: date) -> dict:
-    """Best-effort. Fetches ~VOLUME_STATS_LOOKBACK_DAYS+buffer calendar days
-    of daily bars ending on trade_date (so it includes the entry day itself
-    for volume_on_entry_day), computes the 30d average from the days
-    STRICTLY BEFORE trade_date (excluding entry day so rvol doesn't measure
-    a day against itself), and fetches float shares separately. Any failure
-    here degrades to nulls/unknown tags rather than raising -- this must
-    never take down a /generate-chart call over a secondary stat."""
+def _resample_daily_from_minute_bars(full_bars: pd.DataFrame) -> pd.DataFrame:
+    """Build daily OHLCV bars by resampling the 1-minute bars this service
+    already fetched for the chart, instead of a second Polygon call to
+    /range/1/day. Restricted to the 09:30-16:00 ET regular session (the
+    minute-bar fetch spans pre-market through after-hours -- see
+    get_full_day_bars' docstring) so the result lines up with what Polygon's
+    own regular-session daily aggregate would return. _fill_intraday_gaps
+    already zero-fills any missing minutes, so summing Volume here doesn't
+    double-count or fabricate volume on thin/gappy days.
+
+    Index is plain datetime.date objects (not Timestamps), matching what
+    _fetch_daily_bars_from_polygon used to return, so callers can keep
+    comparing/indexing against trade_date_obj (a date) unchanged."""
+    if full_bars.empty:
+        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+
+    session_time = full_bars.index.time
+    regular = full_bars[(session_time >= REGULAR_SESSION_START) & (session_time < REGULAR_SESSION_END)]
+    if regular.empty:
+        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+
+    daily = regular.groupby(regular.index.date).agg(
+        Open=("Open", "first"),
+        High=("High", "max"),
+        Low=("Low", "min"),
+        Close=("Close", "last"),
+        Volume=("Volume", "sum"),
+    )
+    return daily
+
+
+def compute_volume_float_stats(symbol: str, trade_date_obj: date, full_bars: pd.DataFrame) -> dict:
+    """Best-effort. Derives daily bars from the minute bars already fetched
+    for this chart (see _resample_daily_from_minute_bars) -- no separate
+    Polygon call -- covering the entry day itself (for volume_on_entry_day)
+    and VOLUME_STATS_LOOKBACK_DAYS prior trading days for the 30d average,
+    computed STRICTLY BEFORE trade_date (excluding entry day so rvol doesn't
+    measure a day against itself).
+
+    Does NOT fetch float shares anymore -- that used to happen right here,
+    on every single /generate-chart call, via a call to _fetch_float_shares
+    (cached per-symbol, but still a live Polygon hit the first time any
+    trade on a given symbol was published). Float is now strictly on-demand:
+    see POST /fetch-float, wired to a "Get float" button on the trade
+    detail page, which calls _fetch_float_shares itself only when a user
+    actually wants that number for that symbol. So float_shares/float_tag
+    below always come back null/"float_unknown" out of this function --
+    they get filled in later, per trade, by /fetch-float.
+
+    Any failure here degrades to nulls/unknown tags rather than raising --
+    this must never take down a /generate-chart call over a secondary stat."""
     empty = {
         "volume_on_entry_day": None, "avg_volume_30d": None, "relative_volume": None,
         "float_shares": None, "avg_volume_tag": "avgvol_unknown",
@@ -667,11 +833,7 @@ def compute_volume_float_stats(symbol: str, trade_date_obj: date) -> dict:
         return empty
 
     try:
-        # Weekends/holidays mean N trading days needs a wider calendar
-        # window -- 1.6x plus a week of slack comfortably covers it.
-        calendar_lookback = int(VOLUME_STATS_LOOKBACK_DAYS * 1.6) + 10
-        start_date = trade_date_obj - timedelta(days=calendar_lookback)
-        daily = _fetch_daily_bars_from_polygon(symbol, start_date, trade_date_obj)
+        daily = _resample_daily_from_minute_bars(full_bars)
         if daily.empty:
             return empty
 
@@ -688,20 +850,14 @@ def compute_volume_float_stats(symbol: str, trade_date_obj: date) -> dict:
             else None
         )
 
-        float_shares = None
-        try:
-            float_shares = _fetch_float_shares(symbol)
-        except Exception as e:
-            log.warning("Float lookup failed for %s: %s", symbol, e)
-
         return {
             "volume_on_entry_day": int(volume_on_entry_day) if volume_on_entry_day is not None else None,
             "avg_volume_30d": round(avg_volume_30d, 1) if avg_volume_30d else None,
             "relative_volume": relative_volume,
-            "float_shares": float_shares,
+            "float_shares": None,  # see this function's docstring -- filled in later via /fetch-float
             "avg_volume_tag": classify_avg_volume(avg_volume_30d),
             "rvol_tag": classify_relative_volume(relative_volume),
-            "float_tag": classify_float(float_shares),
+            "float_tag": classify_float(None),  # "float_unknown" until /fetch-float runs for this trade
         }
     except Exception as e:
         log.warning("Volume/float stats failed for %s on %s: %s", symbol, trade_date_obj, e)
@@ -1184,15 +1340,16 @@ def _build_chart_response(body, start):
     }
 
     # Best-effort, never fatal -- see compute_volume_float_stats' own
-    # try/except. Adds up to 2 extra Polygon calls (float + daily bars),
-    # each paced through the same rate limiter as the minute-bar fetch.
-    # Callers (the n8n "Generate Chart" / "Generate Final Chart" nodes) can
-    # set include_volume_stats: false to skip these 2 calls entirely -- this
-    # matters a lot for a bulk backtest-journal send, where a dozen-plus
-    # trades all queue on the same 1-call/13s Polygon limiter and every
-    # skipped call is 13+ fewer seconds every later item has to wait.
+    # try/except. Daily bars are now resampled from full_bars (already
+    # fetched above) instead of a second Polygon call. The one Polygon call
+    # this can still add is float shares (_fetch_float_shares), and now
+    # that's persisted in symbol_float_shares (see float_shares_store.py),
+    # it's only a real cost the first time a symbol is EVER seen across the
+    # whole app -- not per-restart, not per-user. Callers (the n8n
+    # "Generate Chart" / "Generate Final Chart" nodes) can still set
+    # include_volume_stats: false to skip it entirely.
     if body.get("include_volume_stats", True):
-        indicators.update(compute_volume_float_stats(symbol, datetime.strptime(trade_date, "%Y-%m-%d").date()))
+        indicators.update(compute_volume_float_stats(symbol, datetime.strptime(trade_date, "%Y-%m-%d").date(), full_bars))
     else:
         indicators.update({
             "volume_on_entry_day": None, "avg_volume_30d": None, "relative_volume": None,
@@ -1244,10 +1401,12 @@ def _build_daily_chart_response(body: dict) -> dict:
 
     calendar_lookback = int(lookback_days * 1.6) + 10
     start_date = trade_date_obj - timedelta(days=calendar_lookback)
-    # end_date is trade_date itself so the Polygon call can be reused via
-    # the same cache key as compute_volume_float_stats' own daily-bars
-    # fetch when both happen to be requested for the same symbol/day -- but
-    # only bars strictly before trade_date are actually used below, so the
+    # This is the only remaining caller of _fetch_daily_bars_from_polygon --
+    # compute_volume_float_stats now resamples daily bars from the minute
+    # bars it already has instead (see _resample_daily_from_minute_bars).
+    # This route is the manual "S/R" button on the trade page, never the
+    # automatic pipeline, so it's fine for it to stay a standalone Polygon
+    # call. Only bars strictly before trade_date are used below, so the
     # trader never sees a level informed by the trade day itself.
     daily = _fetch_daily_bars_from_polygon(symbol, start_date, trade_date_obj)
     daily = daily.loc[daily.index < trade_date_obj].tail(lookback_days)
@@ -1346,6 +1505,60 @@ def generate_chart():
         }), 500
 
 
+def _build_full_day_response(body: dict) -> dict:
+    symbol = (body.get("symbol") or "").strip().upper()
+    trade_date = body["trade_date"]
+    session_bars = get_full_day_bars(symbol, trade_date)
+    return {
+        "symbol": symbol,
+        "trade_date": trade_date,
+        "bars": serialize_bars(session_bars),
+    }
+
+
+@app.route("/full-day-bars", methods=["POST", "OPTIONS"])
+def full_day_bars():
+    """POST {symbol, trade_date} -> {symbol, trade_date, bars: [...]}, the
+    same per-bar shape /generate-chart's "bars" field uses (o/h/l/c/v plus
+    vwap/ema9/ema20/macd/macd_signal/macd_hist), but covering the WHOLE
+    trading session for trade_date instead of just the ~WINDOW_BEFORE/
+    WINDOW_AFTER minutes around one trade's entry/exit.
+
+    Called on demand from the trade/practice/rewind pages' "Show full day"
+    control -- never automatically -- so a page view alone never spends a
+    Polygon call. When it IS clicked, it's routed through the same
+    (symbol, trade_date) cache /generate-chart already uses (see
+    _get_cached_raw_bars), so if this symbol+day was already fetched today
+    -- by the original chart generation, by another trade on the same
+    symbol+day, or by an earlier click of this same button -- this costs
+    zero extra Polygon calls. Same reuse tactic polygon_client.py's
+    _bars_cache uses for the backtester, just exposed live instead of only
+    at analysis time."""
+    if request.method == "OPTIONS":
+        return "", 204
+
+    start = time.monotonic()
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        if not body.get("symbol") or not body.get("trade_date"):
+            return jsonify({"error": "symbol and trade_date are required"}), 400
+
+        future = _request_pool.submit(_build_full_day_response, body)
+        try:
+            result = future.result(timeout=REQUEST_HARD_TIMEOUT_S)
+        except FutureTimeoutError:
+            log.error("Hard timeout after %.1fs for full-day-bars %s", time.monotonic() - start, body.get("symbol"))
+            return jsonify({"error": f"full-day-bars exceeded the {REQUEST_HARD_TIMEOUT_S}s hard timeout"}), 504
+
+        return jsonify(result)
+    except ValueError as e:
+        log.warning("ValueError in full-day-bars after %.1fs: %s", time.monotonic() - start, e)
+        return jsonify({"error": str(e)}), 422
+    except Exception as e:
+        log.error("Unhandled error in full-day-bars after %.1fs: %s", time.monotonic() - start, e)
+        return jsonify({"error": f"{type(e).__name__}: {e}", "traceback": traceback.format_exc()}), 500
+
+
 @app.route("/tick-data", methods=["POST", "OPTIONS"])
 def tick_data():
     """Real trade prints for one short window (see the quiz's "Real ticks
@@ -1406,6 +1619,7 @@ import re
 from engine import BacktestConfig, run_backtest, compute_stats, BacktestCancelled
 from orb_strategy import DEFAULT_PARAMS as ORB_DEFAULT_PARAMS
 import backtest_storage
+import float_shares_store
 from supabase_auth import resolve_user_id
 
 # Backtest history/reports used to live in backtest_history.json /
@@ -1430,6 +1644,212 @@ def _require_user():
     if not user_id:
         return None, (jsonify({"error": "missing or invalid Authorization token -- please log in and try again"}), 401)
     return user_id, None
+
+
+@app.route("/fetch-float", methods=["POST", "OPTIONS"])
+def fetch_float():
+    """POST {trade_id, symbol} -> {float_shares, float_tag}. Requires
+    Authorization: Bearer <supabase JWT> (see _require_user).
+
+    On-demand replacement for the float lookup compute_volume_float_stats
+    used to run automatically on every /generate-chart call -- see that
+    function's docstring. Wired to a "Get float" button on the trade
+    detail page (trade.js), so a live Polygon call for a symbol's float
+    now only happens when someone actually asks for it, not for every
+    trade that gets published.
+
+    _fetch_float_shares below still only ever costs Polygon one real call
+    per symbol, ever, across every trade and every account (see
+    float_shares_store.py's in-memory + Supabase caching) -- this route
+    doesn't change that. It just moves WHEN that call can get triggered:
+    from "automatically, on every trade, whether anyone looks or not" to
+    "on request, the first time someone actually wants that symbol's
+    float".
+
+    Also merges the result into this one trade's stored
+    trade_details.indicators and trades.float_tag in Supabase (see
+    float_shares_store.save_float_to_trade), scoped to the calling user,
+    so re-opening the same trade later shows the float without another
+    round trip here."""
+    if request.method == "OPTIONS":
+        return "", 204
+
+    user_id, err = _require_user()
+    if err:
+        return err
+
+    body = request.get_json(force=True, silent=True) or {}
+    trade_id = (body.get("trade_id") or "").strip()
+    symbol = (body.get("symbol") or "").strip().upper()
+    if not trade_id or not symbol:
+        return jsonify({"error": "trade_id and symbol are required"}), 400
+
+    try:
+        shares = _fetch_float_shares(symbol)
+    except Exception as e:
+        log.warning("On-demand float lookup failed for %s: %s", symbol, e)
+        return jsonify({"error": f"Float lookup failed: {e}"}), 502
+
+    float_tag = classify_float(shares)
+
+    try:
+        float_shares_store.save_float_to_trade(user_id, trade_id, shares, float_tag)
+    except Exception as e:
+        # The Polygon lookup already succeeded -- don't fail the request
+        # (and cost the user another click/another Polygon round trip
+        # next time) just because persisting it hit a snag. Worst case
+        # this trade just re-saves next time its "Get float" is clicked.
+        log.warning("Saving float for trade %s (%s) failed (non-fatal): %s", trade_id, symbol, e)
+
+    return jsonify({"float_shares": shares, "float_tag": float_tag})
+
+
+# ---------------------------------------------------------------------------
+# Bulk "fill missing floats" job -- same start/poll/cancel shape as the
+# backtester job below (_backtest_jobs), just walking every symbol this
+# user has a trade on with no float yet instead of every trading day in a
+# date range. Wired to a button on the journal page (journal.html) rather
+# than a per-trade one, so someone doesn't have to open every trade that
+# predates this feature (or got imported in bulk) and click "Get float"
+# one at a time.
+#
+# Runs one live Polygon call per *symbol* (not per trade) -- multiple
+# trades on the same symbol share one _fetch_float_shares call, same
+# caching/rate-limiting as the single-trade /fetch-float route above --
+# then writes the result onto every one of that symbol's trades via
+# save_float_to_trade, so each one shows its float next time it's opened
+# without needing its own "Get float" click.
+# ---------------------------------------------------------------------------
+_float_bulk_jobs = {}
+_float_bulk_jobs_lock = threading.Lock()
+
+
+def _run_float_bulk_job(job_id: str, user_id: str, symbol_to_trade_ids: dict):
+    def cancelled():
+        with _float_bulk_jobs_lock:
+            job = _float_bulk_jobs.get(job_id)
+            return bool(job and job.get("cancel_requested"))
+
+    symbols = sorted(symbol_to_trade_ids.keys())
+    for i, symbol in enumerate(symbols):
+        if cancelled():
+            with _float_bulk_jobs_lock:
+                _float_bulk_jobs[job_id]["status"] = "cancelled"
+            return
+
+        with _float_bulk_jobs_lock:
+            _float_bulk_jobs[job_id]["current_symbol"] = symbol
+            _float_bulk_jobs[job_id]["current_index"] = i  # symbols fully done so far
+
+        trade_ids = symbol_to_trade_ids[symbol]
+        try:
+            shares = _fetch_float_shares(symbol)
+            float_tag = classify_float(shares)
+            for trade_id in trade_ids:
+                try:
+                    float_shares_store.save_float_to_trade(user_id, trade_id, shares, float_tag)
+                except Exception as e:
+                    log.warning("Bulk float job %s: saving %s (trade %s) failed: %s", job_id, symbol, trade_id, e)
+            with _float_bulk_jobs_lock:
+                job = _float_bulk_jobs[job_id]
+                job["trades_updated"] += len(trade_ids)
+                job["updated"].append({"symbol": symbol, "float_shares": shares, "float_tag": float_tag, "trade_ids": trade_ids})
+        except Exception as e:
+            log.warning("Bulk float job %s: lookup for %s failed: %s", job_id, symbol, e)
+            with _float_bulk_jobs_lock:
+                _float_bulk_jobs[job_id]["errors"].append({"symbol": symbol, "error": str(e)})
+
+        with _float_bulk_jobs_lock:
+            _float_bulk_jobs[job_id]["current_index"] = i + 1  # this symbol is now done too
+
+    with _float_bulk_jobs_lock:
+        if _float_bulk_jobs[job_id]["status"] == "running":
+            _float_bulk_jobs[job_id]["status"] = "done"
+
+
+@app.route("/fetch-float/bulk/start", methods=["POST", "OPTIONS"])
+def fetch_float_bulk_start():
+    """Kicks off a background job that finds every trade of the calling
+    user's with no float yet (see float_shares_store.list_trades_missing_float),
+    groups them by symbol, and works through the symbol list one at a time
+    (see _run_float_bulk_job), same start->poll->cancel shape as
+    /backtest/start below. Returns immediately with a job_id -- poll
+    /fetch-float/bulk/status/<job_id> for progress."""
+    if request.method == "OPTIONS":
+        return "", 204
+
+    user_id, err = _require_user()
+    if err:
+        return err
+
+    try:
+        missing = float_shares_store.list_trades_missing_float(user_id)
+    except Exception as e:
+        log.warning("list_trades_missing_float failed for user %s: %s", user_id, e)
+        return jsonify({"error": f"Couldn't look up trades: {e}"}), 502
+
+    symbol_to_trade_ids: dict = {}
+    for row in missing:
+        symbol = (row.get("symbol") or "").strip().upper()
+        trade_id = row.get("id")
+        if not symbol or not trade_id:
+            continue
+        symbol_to_trade_ids.setdefault(symbol, []).append(trade_id)
+
+    job_id = uuid.uuid4().hex[:12]
+    with _float_bulk_jobs_lock:
+        _float_bulk_jobs[job_id] = {
+            "status": "running" if symbol_to_trade_ids else "done",
+            "total_symbols": len(symbol_to_trade_ids),
+            "current_index": 0,
+            "current_symbol": None,
+            "total_trades": sum(len(v) for v in symbol_to_trade_ids.values()),
+            "trades_updated": 0,
+            "updated": [],
+            "errors": [],
+            "cancel_requested": False,
+            "user_id": user_id,  # stripped before responding, same as _backtest_jobs
+        }
+
+    if symbol_to_trade_ids:
+        t = threading.Thread(target=_run_float_bulk_job, args=(job_id, user_id, symbol_to_trade_ids), daemon=True)
+        t.start()
+    return jsonify({"job_id": job_id, "total_symbols": len(symbol_to_trade_ids), "total_trades": sum(len(v) for v in symbol_to_trade_ids.values())})
+
+
+@app.route("/fetch-float/bulk/status/<job_id>", methods=["GET"])
+def fetch_float_bulk_status(job_id):
+    user_id, err = _require_user()
+    if err:
+        return err
+    with _float_bulk_jobs_lock:
+        job = _float_bulk_jobs.get(job_id)
+    if job is None or job.get("user_id") != user_id:
+        return jsonify({"status": "unknown"}), 404
+    return jsonify({k: v for k, v in job.items() if k != "user_id"})
+
+
+@app.route("/fetch-float/bulk/cancel/<job_id>", methods=["POST", "OPTIONS"])
+def fetch_float_bulk_cancel(job_id):
+    # Cooperative cancel, same as /backtest/cancel: flips a flag
+    # _run_float_bulk_job checks between symbols. The symbol currently
+    # in flight finishes (it's one Polygon call plus a handful of small
+    # writes, never long), everything after it stops. Whatever ran
+    # already stays saved on those trades.
+    if request.method == "OPTIONS":
+        return "", 204
+    user_id, err = _require_user()
+    if err:
+        return err
+    with _float_bulk_jobs_lock:
+        job = _float_bulk_jobs.get(job_id)
+        if job is None or job.get("user_id") != user_id:
+            return jsonify({"error": "unknown job"}), 404
+        if job["status"] != "running":
+            return jsonify({"status": job["status"]})
+        job["cancel_requested"] = True
+    return jsonify({"status": "cancelling"})
+
 
 _backtest_jobs = {}
 _backtest_jobs_lock = threading.Lock()
@@ -1598,6 +2018,12 @@ def backtest_start():
         "giveback_pct": _num(body, "giveback_pct", None) or None,
         "giveback_arm_cents": _num(body, "giveback_arm_cents", 0.0),
         "stall_exit": bool(body.get("stall_exit", False)),
+        # Re-entry: on by default (see orb_strategy.py's DEFAULT_PARAMS) --
+        # a symbol/day can produce more than one trade unless the request
+        # explicitly turns it off.
+        "allow_reentry": bool(body.get("allow_reentry", defaults.get("allow_reentry", True))),
+        "max_trades_per_day": _num(body, "max_trades_per_day", defaults.get("max_trades_per_day", 3), int),
+        "reentry_cooldown_minutes": _num(body, "reentry_cooldown_minutes", defaults.get("reentry_cooldown_minutes", 0.0)),
         "flatten_time": body.get("flatten_time", defaults["flatten_time"]),
         # Was hardcoded to "09:30" (regular-hours open) regardless of what
         # the form/AI-config panel sent, which silently threw away any

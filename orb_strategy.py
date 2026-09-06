@@ -143,6 +143,18 @@ Params (all optional):
   giveback_pct                 - % of open gain given back (default None)
   giveback_arm_cents           - cents in favor before giveback arms (default 0.0)
   stall_exit                   - bool (default False)
+
+  # re-entry (multiple trades per symbol/day)
+  allow_reentry            - if True, after this trade exits keep scanning
+                              the rest of the session for another valid
+                              entry under the same rule, instead of
+                              stopping at one (default True)
+  max_trades_per_day        - cap on trades taken per symbol/day when
+                              allow_reentry is on (default 3)
+  reentry_cooldown_minutes  - minutes to wait after an exit before the
+                              re-entry scan resumes; 0 still waits for the
+                              next bar so a trade can't re-enter on the
+                              exact bar it just exited (default 0.0)
 """
 
 from datetime import datetime, timedelta, time as dtime
@@ -179,6 +191,10 @@ DEFAULT_PARAMS = {
     "giveback_pct": None,
     "giveback_arm_cents": 0.0,
     "stall_exit": False,
+
+    "allow_reentry": True,
+    "max_trades_per_day": 3,
+    "reentry_cooldown_minutes": 0.0,
 }
 
 
@@ -192,7 +208,11 @@ def _parse_hhmm(s: str) -> dtime:
 # dict) or None. `pattern_stop` is what stop_mode="pattern" will use.
 # ---------------------------------------------------------------------------
 
-def _find_orb_breakout_entry(session_bars, orb_end_dt):
+def _find_orb_breakout_entry(session_bars, orb_end_dt, scan_from_dt=None):
+    """scan_from_dt lets a re-entry pass resume looking for a fresh break of
+    the SAME opening range further into the session, without recomputing
+    orb_high/orb_low off a later window -- the opening range itself is
+    always fixed to the actual first orb_minutes of the day."""
     orb_bars = session_bars[session_bars.index < orb_end_dt]
     if orb_bars.empty:
         return None
@@ -201,7 +221,8 @@ def _find_orb_breakout_entry(session_bars, orb_end_dt):
     if orb_high <= orb_low:
         return None
 
-    post_orb = session_bars[session_bars.index >= orb_end_dt]
+    scan_from_dt = max(scan_from_dt, orb_end_dt) if scan_from_dt is not None else orb_end_dt
+    post_orb = session_bars[session_bars.index >= scan_from_dt]
     if post_orb.empty:
         return None
 
@@ -522,70 +543,57 @@ def _resolve_stop(p, session_bars, entry_idx, entry_price, pattern_stop):
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def simulate_orb_trade(bars: "pd.DataFrame", trade_date, params: dict = None) -> dict | None:
-    """
-    bars: 1-minute OHLCV DataFrame for ONE trading day, tz-aware index
-          (America/New_York), as returned by polygon_client.fetch_minute_bars.
-    trade_date: date object, just used to build session boundary timestamps.
-    Returns a trade dict, or None if no valid setup.
-    """
-    p = {**DEFAULT_PARAMS, **(params or {})}
-    if bars.empty:
-        return None
-
-    session_open = _parse_hhmm(p["session_open"])
-    flatten = _parse_hhmm(p["flatten_time"])
-
-    open_dt = datetime.combine(trade_date, session_open, tzinfo=ET)
-    orb_end_dt = open_dt + timedelta(minutes=p["orb_minutes"])
-    flatten_dt = datetime.combine(trade_date, flatten, tzinfo=ET)
-
-    session_bars = bars[(bars.index >= open_dt) & (bars.index <= flatten_dt)]
-    if session_bars.empty:
-        return None
-
+def _find_entry(session_bars, p: dict, orb_end_dt, scan_from_dt):
+    """Dispatches to the configured entry_mode's finder, scanning from
+    scan_from_dt onward. Used both for a symbol/day's first entry (where
+    scan_from_dt is orb_end_dt or session open, per entry_after_orb) and
+    for every re-entry attempt (where scan_from_dt is the prior trade's
+    exit + cooldown) -- the finders themselves don't know or care which
+    case they're in, they just look for their pattern at/after scan_from_dt."""
     entry_mode = p["entry_mode"]
-    after_orb = bool(p.get("entry_after_orb", True))
 
     if entry_mode == "orb_breakout":
-        found = _find_orb_breakout_entry(session_bars, orb_end_dt)
-    elif entry_mode == "red_candle_break":
-        scan_bars = session_bars[session_bars.index >= orb_end_dt] if after_orb else session_bars
-        found = _find_red_candle_break_entry(scan_bars) if not scan_bars.empty else None
-    elif entry_mode == "donchian_break":
-        scan_bars = session_bars[session_bars.index >= orb_end_dt] if after_orb else session_bars
-        found = _find_donchian_break_entry(scan_bars, int(p["donchian_lookback"])) if not scan_bars.empty else None
-    elif entry_mode == "inside_bar_break":
-        scan_bars = session_bars[session_bars.index >= orb_end_dt] if after_orb else session_bars
-        found = _find_inside_bar_break_entry(scan_bars) if not scan_bars.empty else None
-    elif entry_mode == "vwap_reclaim":
+        return _find_orb_breakout_entry(session_bars, orb_end_dt, scan_from_dt)
+
+    if entry_mode in ("red_candle_break", "donchian_break", "inside_bar_break"):
+        scan_bars = session_bars[session_bars.index >= scan_from_dt]
+        if scan_bars.empty:
+            return None
+        if entry_mode == "red_candle_break":
+            return _find_red_candle_break_entry(scan_bars)
+        if entry_mode == "donchian_break":
+            return _find_donchian_break_entry(scan_bars, int(p["donchian_lookback"]))
+        return _find_inside_bar_break_entry(scan_bars)
+
+    # The remaining modes track a session-cumulative indicator (VWAP/EMA/
+    # MACD/RSI), so they need the FULL session_bars for warmup history --
+    # only the scan start index moves for a re-entry, never the bars passed in.
+    scan_start_idx = len(session_bars[session_bars.index < scan_from_dt])
+    if entry_mode == "vwap_reclaim":
         if "Volume" not in session_bars.columns:
             return None
-        scan_start_idx = len(session_bars[session_bars.index < orb_end_dt]) if after_orb else 0
-        found = _find_vwap_reclaim_entry(session_bars, scan_start_idx)
-    elif entry_mode == "ema_dip_reclaim":
-        scan_start_idx = len(session_bars[session_bars.index < orb_end_dt]) if after_orb else 0
-        found = _find_ema_dip_reclaim_entry(session_bars, scan_start_idx, int(p["ema_period"]))
-    elif entry_mode == "ema_reclaim":
-        scan_start_idx = len(session_bars[session_bars.index < orb_end_dt]) if after_orb else 0
-        found = _find_ema_reclaim_entry(session_bars, scan_start_idx, int(p["ema_period"]))
-    elif entry_mode == "macd_bullish_cross":
-        scan_start_idx = len(session_bars[session_bars.index < orb_end_dt]) if after_orb else 0
-        found = _find_macd_bullish_cross_entry(
+        return _find_vwap_reclaim_entry(session_bars, scan_start_idx)
+    if entry_mode == "ema_dip_reclaim":
+        return _find_ema_dip_reclaim_entry(session_bars, scan_start_idx, int(p["ema_period"]))
+    if entry_mode == "ema_reclaim":
+        return _find_ema_reclaim_entry(session_bars, scan_start_idx, int(p["ema_period"]))
+    if entry_mode == "macd_bullish_cross":
+        return _find_macd_bullish_cross_entry(
             session_bars, scan_start_idx, int(p["macd_fast"]), int(p["macd_slow"]), int(p["macd_signal"])
         )
-    elif entry_mode == "rsi_oversold_bounce":
-        scan_start_idx = len(session_bars[session_bars.index < orb_end_dt]) if after_orb else 0
-        found = _find_rsi_oversold_bounce_entry(
+    if entry_mode == "rsi_oversold_bounce":
+        return _find_rsi_oversold_bounce_entry(
             session_bars, scan_start_idx, int(p["rsi_period"]), float(p["rsi_oversold"])
         )
-    else:
-        found = _find_orb_breakout_entry(session_bars, orb_end_dt)
+    return _find_orb_breakout_entry(session_bars, orb_end_dt, scan_from_dt)
 
-    if found is None:
-        return None
-    entry_idx, entry_price, pattern_stop, extra = found
 
+def _manage_trade_to_exit(session_bars, entry_idx, entry_price, pattern_stop, extra, p: dict):
+    """Everything from 'stop is resolved' through 'position is flat' for ONE
+    trade -- pulled out of simulate_orb_trades so a re-entry can call it
+    again for a second/third trade the same session without repeating this
+    logic. Returns a trade dict, or None if the entry doesn't yield valid
+    (positive) risk."""
     stop_price = _resolve_stop(p, session_bars, entry_idx, entry_price, pattern_stop)
     risk = entry_price - stop_price
     if risk <= 0:
@@ -690,3 +698,69 @@ def simulate_orb_trade(bars: "pd.DataFrame", trade_date, params: dict = None) ->
     }
     result.update({k: (round(v, 4) if isinstance(v, float) else v) for k, v in extra.items()})
     return result
+
+
+def simulate_orb_trades(bars: "pd.DataFrame", trade_date, params: dict = None) -> list:
+    """
+    bars: 1-minute OHLCV DataFrame for ONE trading day, tz-aware index
+          (America/New_York), as returned by polygon_client.fetch_minute_bars.
+    trade_date: date object, just used to build session boundary timestamps.
+    Returns a list of trade dicts in chronological order (possibly empty).
+
+    With params["allow_reentry"] True (the default), once a trade exits
+    the same entry rule keeps scanning the rest of the session for another
+    valid setup, up to max_trades_per_day, waiting reentry_cooldown_minutes
+    (minimum one bar) after each exit before looking again. Set it False
+    to restore the original single-shot-per-symbol/day behavior.
+    """
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    if bars.empty:
+        return []
+
+    session_open = _parse_hhmm(p["session_open"])
+    flatten = _parse_hhmm(p["flatten_time"])
+
+    open_dt = datetime.combine(trade_date, session_open, tzinfo=ET)
+    orb_end_dt = open_dt + timedelta(minutes=p["orb_minutes"])
+    flatten_dt = datetime.combine(trade_date, flatten, tzinfo=ET)
+
+    session_bars = bars[(bars.index >= open_dt) & (bars.index <= flatten_dt)]
+    if session_bars.empty:
+        return []
+
+    after_orb = bool(p.get("entry_after_orb", True))
+    allow_reentry = bool(p.get("allow_reentry", True))
+    max_trades = int(p.get("max_trades_per_day") or 1) if allow_reentry else 1
+    cooldown = timedelta(minutes=float(p.get("reentry_cooldown_minutes") or 0.0))
+
+    trades = []
+    scan_from_dt = orb_end_dt if after_orb else open_dt
+
+    while len(trades) < max_trades and scan_from_dt < flatten_dt:
+        found = _find_entry(session_bars, p, orb_end_dt, scan_from_dt)
+        if found is None:
+            break
+        entry_idx, entry_price, pattern_stop, extra = found
+        trade = _manage_trade_to_exit(session_bars, entry_idx, entry_price, pattern_stop, extra, p)
+        if trade is None:
+            break
+        trades.append(trade)
+
+        if not allow_reentry:
+            break
+        # Always advance past the exit bar, even with 0 cooldown, so a
+        # trade can't immediately "re-enter" on the bar it just exited on.
+        next_scan_from = trade["exit_time"] + cooldown
+        if next_scan_from <= trade["exit_time"]:
+            next_scan_from = trade["exit_time"] + timedelta(minutes=1)
+        scan_from_dt = next_scan_from
+
+    return trades
+
+
+def simulate_orb_trade(bars: "pd.DataFrame", trade_date, params: dict = None) -> dict | None:
+    """Back-compat wrapper: same contract this function always had (one
+    trade or None). New call sites -- and engine.py, updated alongside this
+    -- should call simulate_orb_trades() instead to see every re-entry."""
+    trades = simulate_orb_trades(bars, trade_date, params)
+    return trades[0] if trades else None

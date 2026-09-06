@@ -4,8 +4,10 @@ Orchestrates the backtest: for each trading day in range, find the top-N
 gappers, simulate the strategy on each, and aggregate results + stats.
 
 Swappable strategy: pass any callable with the signature
-    (bars_df, trade_date, params) -> trade_dict | None
-Defaults to orb_strategy.simulate_orb_trade.
+    (bars_df, trade_date, params) -> list[trade_dict]
+Defaults to orb_strategy.simulate_orb_trades, which returns a list of one
+trade per symbol/day unless params["allow_reentry"] is on, in which case a
+symbol/day can produce more than one trade (see orb_strategy.py).
 """
 
 import logging
@@ -15,7 +17,7 @@ from datetime import date
 import pandas as pd
 
 import polygon_client as pc
-from orb_strategy import simulate_orb_trade, DEFAULT_PARAMS
+from orb_strategy import simulate_orb_trades, DEFAULT_PARAMS
 
 log = logging.getLogger("backtest.engine")
 
@@ -85,7 +87,7 @@ class BacktestConfig:
     min_gap_pct: float = 5.0
     position_size_dollars: float = 2000.0  # notional per trade, for $ P&L (not just per-share/R stats)
     strategy_params: dict = field(default_factory=lambda: dict(DEFAULT_PARAMS))
-    strategy_fn: callable = simulate_orb_trade
+    strategy_fn: callable = simulate_orb_trades
     include_commissions: bool = True  # estimate IBKR-tiered-style commissions and net them out of pnl_dollars/win
 
     # --- Capital / position sizing -----------------------------------
@@ -108,8 +110,10 @@ class BacktestConfig:
 
 def run_backtest(cfg: BacktestConfig, progress_cb=None, cancel_check=None) -> list[dict]:
     """
-    Returns a list of trade dicts (one per symbol/day that produced a
-    trade), each with: date, symbol, gap_pct, entry_time, entry_price,
+    Returns a list of trade dicts (normally one per symbol/day that
+    produced a trade, or several per symbol/day if
+    cfg.strategy_params["allow_reentry"] is on -- see orb_strategy.py),
+    each with: date, symbol, gap_pct, entry_time, entry_price,
     exit_time, exit_price, exit_reason, shares, risk_per_share,
     pnl_per_share, pnl_dollars_gross, commission_entry, commission_exit,
     commission_total, pnl_dollars, r_multiple, win.
@@ -173,64 +177,68 @@ def run_backtest(cfg: BacktestConfig, progress_cb=None, cancel_check=None) -> li
                 continue
 
             try:
-                result = cfg.strategy_fn(bars, d, cfg.strategy_params)
+                results = cfg.strategy_fn(bars, d, cfg.strategy_params)
             except Exception as e:
                 log.warning("Skipping %s %s -- strategy error: %s", symbol, d, e)
                 continue
 
-            if result is None:
-                continue
+            # Normally 0 or 1 trade; more than one only when
+            # strategy_params["allow_reentry"] is on (see orb_strategy.py).
+            # Looping here instead of assuming a single result is the only
+            # change from before this existed -- equity compounding and the
+            # monthly commission-volume tier both still update once per
+            # trade, in the chronological order simulate_orb_trades returns.
+            for result in results:
+                if cfg.position_sizing_mode == "pct_of_capital":
+                    notional = max(equity, 0.0) * (cfg.position_size_pct / 100.0)
+                    shares = int(notional / result["entry_price"]) if result["entry_price"] else 0
+                elif cfg.position_sizing_mode == "risk_pct_of_capital":
+                    risk_dollars = max(equity, 0.0) * (cfg.risk_pct_of_capital / 100.0)
+                    shares = int(risk_dollars / result["risk_per_share"]) if result["risk_per_share"] else 0
+                else:  # "fixed_dollars" (default, unchanged from before this existed)
+                    shares = int(cfg.position_size_dollars / result["entry_price"]) if result["entry_price"] else 0
 
-            if cfg.position_sizing_mode == "pct_of_capital":
-                notional = max(equity, 0.0) * (cfg.position_size_pct / 100.0)
-                shares = int(notional / result["entry_price"]) if result["entry_price"] else 0
-            elif cfg.position_sizing_mode == "risk_pct_of_capital":
-                risk_dollars = max(equity, 0.0) * (cfg.risk_pct_of_capital / 100.0)
-                shares = int(risk_dollars / result["risk_per_share"]) if result["risk_per_share"] else 0
-            else:  # "fixed_dollars" (default, unchanged from before this existed)
-                shares = int(cfg.position_size_dollars / result["entry_price"]) if result["entry_price"] else 0
+                pnl_dollars_gross = shares * result["pnl_per_share"]
 
-            pnl_dollars_gross = shares * result["pnl_per_share"]
+                if cfg.include_commissions:
+                    month_key = d.strftime("%Y-%m")
+                    prior_volume = monthly_shares.get(month_key, 0.0)
+                    commission_entry = estimate_commission(shares, result["entry_price"], prior_volume)
+                    prior_volume += shares
+                    commission_exit = estimate_commission(shares, result["exit_price"], prior_volume)
+                    prior_volume += shares
+                    monthly_shares[month_key] = prior_volume
+                    commission_total = round(commission_entry + commission_exit, 2)
+                    pnl_dollars = round(pnl_dollars_gross - commission_total, 2)
+                    win = pnl_dollars > 0
+                else:
+                    commission_entry = commission_exit = commission_total = 0.0
+                    pnl_dollars = round(pnl_dollars_gross, 2)
+                    win = result["win"]
 
-            if cfg.include_commissions:
-                month_key = d.strftime("%Y-%m")
-                prior_volume = monthly_shares.get(month_key, 0.0)
-                commission_entry = estimate_commission(shares, result["entry_price"], prior_volume)
-                prior_volume += shares
-                commission_exit = estimate_commission(shares, result["exit_price"], prior_volume)
-                prior_volume += shares
-                monthly_shares[month_key] = prior_volume
-                commission_total = round(commission_entry + commission_exit, 2)
-                pnl_dollars = round(pnl_dollars_gross - commission_total, 2)
-                win = pnl_dollars > 0
-            else:
-                commission_entry = commission_exit = commission_total = 0.0
-                pnl_dollars = round(pnl_dollars_gross, 2)
-                win = result["win"]
-
-            trades.append({
-                "date": d.isoformat(),
-                "symbol": symbol,
-                "gap_pct": round(float(row["gap_pct"]), 2),
-                "entry_time": result["entry_time"].strftime("%H:%M:%S"),
-                "entry_price": result["entry_price"],
-                "exit_time": result["exit_time"].strftime("%H:%M:%S"),
-                "exit_price": result["exit_price"],
-                "exit_reason": result["exit_reason"],
-                "stop_price": result["stop_price"],
-                "target_price": result["target_price"],
-                "shares": shares,
-                "risk_per_share": result["risk_per_share"],
-                "pnl_per_share": result["pnl_per_share"],
-                "pnl_dollars_gross": round(pnl_dollars_gross, 2),
-                "commission_entry": round(commission_entry, 2),
-                "commission_exit": round(commission_exit, 2),
-                "commission_total": commission_total,
-                "pnl_dollars": pnl_dollars,
-                "r_multiple": result["r_multiple"],
-                "win": win,
-            })
-            equity += pnl_dollars
+                trades.append({
+                    "date": d.isoformat(),
+                    "symbol": symbol,
+                    "gap_pct": round(float(row["gap_pct"]), 2),
+                    "entry_time": result["entry_time"].strftime("%H:%M:%S"),
+                    "entry_price": result["entry_price"],
+                    "exit_time": result["exit_time"].strftime("%H:%M:%S"),
+                    "exit_price": result["exit_price"],
+                    "exit_reason": result["exit_reason"],
+                    "stop_price": result["stop_price"],
+                    "target_price": result["target_price"],
+                    "shares": shares,
+                    "risk_per_share": result["risk_per_share"],
+                    "pnl_per_share": result["pnl_per_share"],
+                    "pnl_dollars_gross": round(pnl_dollars_gross, 2),
+                    "commission_entry": round(commission_entry, 2),
+                    "commission_exit": round(commission_exit, 2),
+                    "commission_total": commission_total,
+                    "r_multiple": result["r_multiple"],
+                    "pnl_dollars": pnl_dollars,
+                    "win": win,
+                })
+                equity += pnl_dollars
 
     trades.sort(key=lambda t: (t["date"], t["entry_time"]))
     return trades

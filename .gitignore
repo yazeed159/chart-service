@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+
+# Local-only credentials -- see README for how to set env vars on Render instead.
+polygon.env.ps1
+.env
