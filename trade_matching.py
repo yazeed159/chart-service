@@ -3,6 +3,13 @@ trade_matching.py
 Trade-execution parsing + FIFO matching, ported from n8n's
 "Extract & Match Trades1" code node.
 
+Each closed trade also carries "Fill Count" and "Fills" -- the raw
+FIFO-matched fills that were merged/averaged into that trade's single
+Entry Price/Exit Price. This is real detail the averaging step would
+otherwise throw away (e.g. one entry sold in two pieces at different
+exit prices/times): "Fill Count" > 1 means Entry/Exit Price is a
+quantity-weighted average, and "Fills" has the individual pieces.
+
 Shared between:
   - /import-trades (CSV import -- this round)
   - the daily IBKR Flex sync pipeline (next round)
@@ -235,6 +242,20 @@ def fifo_match_and_merge(raw_trades: list[dict], account: Optional[dict] = None)
         total_sec = round((exit_dt - first["entryDateTime"]).total_seconds())
         time_in_trade = f"{total_sec // 60:02d}:{total_sec % 60:02d}"
 
+        # The individual raw FIFO matches merged into this trade -- this is
+        # exactly what Entry/Exit Price above average away. Sorted by exit
+        # time so a scaled-out trade's fills read in the order they filled.
+        fills_sorted = sorted(matches, key=lambda m: m["exitDateTime"])
+        fills = [{
+            "entry_time": format_time(m["entryDateTime"]),
+            "entry_price": round(m["entryPrice"], 4),
+            "exit_time": format_time(m["exitDateTime"]),
+            "exit_price": round(m["exitPrice"], 4),
+            "qty": m["matchQty"],
+            "pnl_before_comm": round(m["pnlBeforeComm"], 2),
+            "commission": round(m["commission"], 2),
+        } for m in fills_sorted]
+
         closed_trades.append({
             "_exitDT": exit_dt,
             "#": 0,
@@ -252,6 +273,8 @@ def fifo_match_and_merge(raw_trades: list[dict], account: Optional[dict] = None)
             "Commission": round(commission, 2),
             "P&L After Comm": round(pnl_before_comm - commission, 2),
             "Result": "Win" if (pnl_before_comm - commission) >= 0 else "Loss",
+            "Fill Count": len(matches),
+            "Fills": fills,
             "Entry Comments": "",
             "Exit Comments": "",
             "Notes": "",

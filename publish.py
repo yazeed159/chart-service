@@ -134,6 +134,7 @@ def prepare_trade_payload(trade: dict) -> dict:
         "shares": trade.get("No. of Shares"), "time_in_trade": trade.get("Time in Trade"),
         "pnl_before_comm": trade.get("P&L Before Comm"), "commission": trade.get("Commission"),
         "pnl_after_comm": trade.get("P&L After Comm"), "win": trade.get("Result") == "Win",
+        "fill_count": trade.get("Fill Count") or 1, "fills": trade.get("Fills") or [],
         "verdict": trade.get("LLM Reasoning") or "", "setup_type": trade.get("Setup Type") or "",
         "better_entry": better_entry, "better_exit": better_exit,
         "suggested_stop": trade.get("Suggested Stop"), "suggested_target": trade.get("Suggested Target"),
@@ -153,6 +154,7 @@ def prepare_trade_payload(trade: dict) -> dict:
         "entry_price": detail["entry_price"], "exit_price": detail["exit_price"], "shares": detail["shares"],
         "pnl_before_comm": detail["pnl_before_comm"], "commission": detail["commission"],
         "pnl_after_comm": detail["pnl_after_comm"], "win": detail["win"], "setup_type": detail["setup_type"],
+        "fill_count": detail["fill_count"],
         "verdict_label": trade.get("Verdict") or "",
         "better_entry_price": better_entry["price"] if better_entry else None,
         "better_exit_price": better_exit["price"] if better_exit else None,
@@ -183,6 +185,7 @@ def _publish_trade_detail(payload: dict) -> bool:
     body = [{
         "trade_id": payload["id"], "user_id": payload["user_id"],
         "time_in_trade": detail["time_in_trade"], "verdict": detail["verdict"],
+        "fill_count": detail["fill_count"], "fills": detail["fills"],
         "indicators": detail["indicators"], "bars": detail["bars"],
         "better_entry": detail["better_entry"], "better_exit": detail["better_exit"],
         "suggested_stop": detail["suggested_stop"], "suggested_target": detail["suggested_target"],
