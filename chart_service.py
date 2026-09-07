@@ -1148,8 +1148,20 @@ def _render_chart_locked(df, symbol, entry_dt, exit_dt, entry_price, exit_price,
         if dt_val is None:
             return None
         try:
-            x = int(df.index.get_indexer([pd.Timestamp(dt_val)], method="nearest")[0])
+            ts = pd.Timestamp(dt_val)
+            # df.index is tz-aware ET (see compute_indicators/fetch_bars).
+            # better_entry_time/better_exit_time come in as naive local-ET
+            # strings (same convention as serialize_bars' "t" field), so
+            # localize rather than convert -- ts already IS ET wall-clock
+            # time, it just doesn't carry the tzinfo yet. Comparing a naive
+            # Timestamp against a tz-aware index raises, which used to be
+            # swallowed by the except below with no log -- the marker just
+            # silently never appeared.
+            if ts.tzinfo is None:
+                ts = ts.tz_localize(ET)
+            x = int(df.index.get_indexer([ts], method="nearest")[0])
         except Exception:
+            log.warning("Couldn't place %s better-%s marker for %s at %r", symbol, kind, symbol, dt_val)
             return None
         y = _local_high(x) + label_gap + box_half_height * (3 if kind == "entry" else 3.6)
         return (x, y)
@@ -1282,10 +1294,22 @@ def _build_chart_response(body, start):
     # one that gets published) shows where the trade should've been taken,
     # not just where it was.
     def _better(price_key, time_key):
+        # NOTE: t is already a full "<date>T<time>" timestamp -- it's the
+        # verdict's better_entry_time/better_exit_time, which daily_sync.py's
+        # prompt requires be copied EXACTLY from one of the bar rows' own "t"
+        # values (see _bar_table_for_prompt), and serialize_bars() already
+        # writes those as full "%Y-%m-%dT%H:%M:%S" strings, not bare HH:MM:SS.
+        # This used to re-prepend trade_date here (f"{trade_date}T{t}"),
+        # producing a malformed double-date string like
+        # "2026-08-12T2026-08-12T09:59:00" -- dateutil's fallback parser
+        # accepted that silently and misread part of it as a UTC offset,
+        # so the "better entry/exit" marker either landed on the wrong bar
+        # or (once _better_pos's tz mismatch below also kicked in) never
+        # rendered at all, with nothing surfaced to say why.
         p, t = body.get(price_key), body.get(time_key)
         if p is None or t is None:
             return None
-        return {"price": float(p), "time": f"{trade_date}T{t}"}
+        return {"price": float(p), "time": t}
 
     better_entry = _better("better_entry_price", "better_entry_time")
     better_exit = _better("better_exit_price", "better_exit_time")
@@ -2368,6 +2392,30 @@ def strategies_get_delete(strategy_id):
     if row is None:
         return jsonify({"error": "not found"}), 404
     return jsonify(row)
+
+
+import gappers_store
+
+
+# --- Live gappers: read-only view of scanner.py's premarket scan, for
+# web-service's /scanner.html page. Market-wide, not user-scoped (see
+# gappers_store.py's docstring) -- every logged-in account sees the same
+# rows. Still auth-gated (not a public endpoint) since nothing on this
+# site is public.
+@app.route("/gappers", methods=["GET", "OPTIONS"])
+def gappers_list():
+    if request.method == "OPTIONS":
+        return "", 204
+    _, err = _require_user()
+    if err:
+        return err
+    now_et = datetime.now(ET)
+    session_active = now_et.weekday() < 5 and dtime(4, 0) <= now_et.time() < dtime(9, 30)
+    return jsonify({
+        "rows": gappers_store.list_todays_gappers(limit=50),
+        "server_time": now_et.isoformat(),
+        "session_active": session_active,
+    })
 
 
 @app.route("/backtest/history/<job_id>/save-strategy", methods=["POST", "OPTIONS"])

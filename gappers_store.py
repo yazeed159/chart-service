@@ -61,7 +61,7 @@ TABLE = "gappers"
 # A row not refreshed within this window is treated as no longer
 # qualifying (dropped out of the top list, or the scanner stopped for the
 # day) -- see the freshness-instead-of-deletes note above. Comfortably
-# above scanner.py's poll interval (default 20s) so a normal cycle gap
+# above scanner.py's poll interval (default 5s) so a normal cycle gap
 # never falsely ages a symbol out.
 FRESHNESS_WINDOW_MIN = 5
 
@@ -140,6 +140,31 @@ def get_todays_gappers(top_n: int = 5, min_price: float = 1.0, max_price: float 
     rows = resp.json()
     rows = [r for r in rows if r["price"] <= max_price and r["price"] * r["premkt_volume"] >= min_dollar_volume]
     return rows[:top_n]
+
+
+def list_todays_gappers(limit: int = 50) -> list[dict]:
+    """Raw, unfiltered-by-strategy view of today's scan -- what the
+    /gappers page (web-service) shows everyone, as opposed to
+    get_symbols_for_rule's per-strategy-threshold view. No freshness cut
+    here (unlike get_todays_gappers) -- the page itself shows each row's
+    age and a stale/inactive state, since a person looking at the page
+    wants to see the scanner stopped, not have stale rows silently
+    vanish."""
+    _require_config()
+    today = datetime.now(ET).date()
+    resp = requests.get(
+        f"{SUPABASE_URL}/rest/v1/{TABLE}",
+        headers=_headers(),
+        params={
+            "select": "symbol,price,gap_pct,premkt_volume,updated_at",
+            "scan_date": f"eq.{today.isoformat()}",
+            "order": "gap_pct.desc",
+            "limit": str(limit),
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()
 
 
 def get_symbols_for_rule(rule: dict) -> list[str]:

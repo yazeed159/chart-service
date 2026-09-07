@@ -55,7 +55,12 @@ inherit chart-service's web service env vars just because it's the same
 repo):
   POLYGON_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY  - reused
   ALPACA_API_KEY_ID, ALPACA_API_SECRET_KEY                  - new
-  SCANNER_POLL_INTERVAL_S   - default 20
+  SCANNER_POLL_INTERVAL_S   - default 5. Well within Alpaca's free-tier
+    200 calls/min (~1-2 calls per cycle -- this could go lower still, but
+    5s is already close to the floor of what matters: the IEX feed itself
+    isn't tick-by-tick guaranteed faster than that, and live-service's own
+    re-check (GAPPERS_RUN_POLL_S, engine.py) is the other half of the
+    latency budget)
   SCANNER_MIN_PRICE / SCANNER_MAX_PRICE               - default 1 / 50
   SCANNER_MIN_DOLLAR_VOLUME                            - default 1_000_000
     (universe-building threshold -- deliberately looser than a strategy's
@@ -83,7 +88,7 @@ log = logging.getLogger("scanner")
 
 ET = ZoneInfo("America/New_York")
 
-POLL_INTERVAL_S = float(os.environ.get("SCANNER_POLL_INTERVAL_S", 20))
+POLL_INTERVAL_S = float(os.environ.get("SCANNER_POLL_INTERVAL_S", 5))
 MIN_PRICE = float(os.environ.get("SCANNER_MIN_PRICE", 1.0))
 MAX_PRICE = float(os.environ.get("SCANNER_MAX_PRICE", 50.0))
 MIN_DOLLAR_VOLUME = float(os.environ.get("SCANNER_MIN_DOLLAR_VOLUME", 1_000_000))
