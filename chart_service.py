@@ -2018,12 +2018,36 @@ def backtest_start():
         "giveback_pct": _num(body, "giveback_pct", None) or None,
         "giveback_arm_cents": _num(body, "giveback_arm_cents", 0.0),
         "stall_exit": bool(body.get("stall_exit", False)),
+        "ema_close_exit": bool(body.get("ema_close_exit", defaults.get("ema_close_exit", False))),
+        "require_macd_confirmation": bool(body.get("require_macd_confirmation", defaults.get("require_macd_confirmation", False))),
         # Re-entry: on by default (see orb_strategy.py's DEFAULT_PARAMS) --
         # a symbol/day can produce more than one trade unless the request
         # explicitly turns it off.
         "allow_reentry": bool(body.get("allow_reentry", defaults.get("allow_reentry", True))),
         "max_trades_per_day": _num(body, "max_trades_per_day", defaults.get("max_trades_per_day", 3), int),
         "reentry_cooldown_minutes": _num(body, "reentry_cooldown_minutes", defaults.get("reentry_cooldown_minutes", 0.0)),
+        "slippage_bps": _num(body, "slippage_bps", defaults.get("slippage_bps", 5.0)),
+        # Position building -- "buy some, add on strength" (see
+        # orb_strategy.py's POSITION BUILDING section). Off unless the
+        # request explicitly turns it on.
+        "scale_in_enabled": bool(body.get("scale_in_enabled", False)),
+        "scale_in_initial_size_pct": _num(body, "scale_in_initial_size_pct", defaults.get("scale_in_initial_size_pct", 50.0)),
+        "scale_in_add_size_pct": _num(body, "scale_in_add_size_pct", defaults.get("scale_in_add_size_pct", 25.0)),
+        "scale_in_max_adds": _num(body, "scale_in_max_adds", defaults.get("scale_in_max_adds", 2), int),
+        "scale_in_hold_bars": _num(body, "scale_in_hold_bars", defaults.get("scale_in_hold_bars", 2), int),
+        "scale_in_min_gain_cents": _num(body, "scale_in_min_gain_cents", defaults.get("scale_in_min_gain_cents", 10.0)),
+        # Tightening trail-protect stop -- ratchets up to lock in a growing
+        # fraction of the peak gain as the trade's peak R climbs. Off
+        # unless the request explicitly turns it on. Ladder is sent (and
+        # returned by /backtest/defaults) as a flat list of [r, protect_frac]
+        # pairs -- JSON has no tuples, but a 2-element array round-trips
+        # through jsonify() the same way orb_strategy.py's tuple defaults do.
+        "trail_protect_enabled": bool(body.get("trail_protect_enabled", False)),
+        "trail_protect_ladder": [
+            (float(rung[0]), float(rung[1]))
+            for rung in (body.get("trail_protect_ladder") or [])
+            if isinstance(rung, (list, tuple)) and len(rung) == 2
+        ] or list(defaults.get("trail_protect_ladder", [])),
         "flatten_time": body.get("flatten_time", defaults["flatten_time"]),
         # Was hardcoded to "09:30" (regular-hours open) regardless of what
         # the form/AI-config panel sent, which silently threw away any
@@ -2122,7 +2146,46 @@ def backtest_history_report(job_id):
     report = _backtest_report_load(job_id, user_id)
     if report is None:
         return jsonify({"error": "no saved report for this run (may predate this feature, may not be yours, or the run didn't finish)"}), 404
+    # Once a run's charts have been generated, each trade's `bars` is a
+    # full session's worth of 1-min OHLCV -- easily the overwhelming
+    # majority of this payload's weight for a run of any real size, and
+    # the report view only ever needs it lazily, one trade at a time, when
+    # something is actually clicked (View Chart, a Best/Worst stat, an
+    # Overview breakdown row). Strip it out of the default response --
+    # replaced with a cheap has_bars flag so the UI still knows whether a
+    # chart is available -- and serve it through the dedicated per-trade
+    # endpoint below instead. ?full=1 restores the old all-at-once shape,
+    # for anything that genuinely still needs every trade's bars at once.
+    if request.args.get("full") != "1":
+        trades = report.get("trades") or []
+        report = dict(report)
+        stripped = []
+        for t in trades:
+            t2 = {k: v for k, v in t.items() if k != "bars"}
+            t2["has_bars"] = bool(t.get("bars"))
+            stripped.append(t2)
+        report["trades"] = stripped
     return jsonify(report)
+
+
+@app.route("/backtest/history/<job_id>/report/trade-bars/<int:idx>", methods=["GET"])
+def backtest_history_trade_bars(job_id, idx):
+    """Lazily fetches one trade's bars by its index into the saved
+    report's `trades` array (stable regardless of how the report page has
+    the table currently sorted -- it's an index into the stored order,
+    not whatever order is on screen). Backs the report page's on-demand
+    chart views now that GET /report strips bars out by default (see
+    above)."""
+    user_id, err = _require_user()
+    if err:
+        return err
+    report = _backtest_report_load(job_id, user_id)
+    if report is None:
+        return jsonify({"error": "no saved report for this run (may predate this feature, may not be yours, or the run didn't finish)"}), 404
+    trades = report.get("trades") or []
+    if idx < 0 or idx >= len(trades):
+        return jsonify({"error": "trade index out of range"}), 404
+    return jsonify({"bars": trades[idx].get("bars") or []})
 
 
 @app.route("/backtest/history/<job_id>/enrich", methods=["POST", "OPTIONS"])

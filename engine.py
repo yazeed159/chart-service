@@ -114,9 +114,17 @@ def run_backtest(cfg: BacktestConfig, progress_cb=None, cancel_check=None) -> li
     produced a trade, or several per symbol/day if
     cfg.strategy_params["allow_reentry"] is on -- see orb_strategy.py),
     each with: date, symbol, gap_pct, entry_time, entry_price,
-    exit_time, exit_price, exit_reason, shares, risk_per_share,
+    exit_time, exit_price, exit_reason, shares, fills, risk_per_share,
     pnl_per_share, pnl_dollars_gross, commission_entry, commission_exit,
     commission_total, pnl_dollars, r_multiple, win.
+
+    entry_price is the share-weighted average cost basis across every
+    fill the trade made -- identical to a single-fill trade's entry price
+    when cfg.strategy_params["scale_in_enabled"] is off (the default).
+    When it's on, `fills` breaks that average down into the individual
+    buys (initial + adds), each with its own fill time/price/share count,
+    so the UI can show exactly how the position was built instead of just
+    the blended number. `shares` is always the trade's total across fills.
 
     When cfg.include_commissions is True (the default), pnl_dollars is
     NET of an estimated IBKR-tiered-style commission (see
@@ -189,22 +197,56 @@ def run_backtest(cfg: BacktestConfig, progress_cb=None, cancel_check=None) -> li
             # monthly commission-volume tier both still update once per
             # trade, in the chronological order simulate_orb_trades returns.
             for result in results:
+                # "Full" size is computed off the INITIAL fill's price/risk,
+                # same formulas as before scale-in existed -- a plain trade
+                # (no scale_in_enabled) has exactly one fill at size_frac
+                # 1.0, so full_shares below IS its share count, unchanged.
+                # With scale-in on, this is the size the trade would hold
+                # if it had gone in all at once; each fill in result["fills"]
+                # then gets its own slice of it via size_frac.
+                initial_price = result.get("initial_entry_price", result["entry_price"])
                 if cfg.position_sizing_mode == "pct_of_capital":
                     notional = max(equity, 0.0) * (cfg.position_size_pct / 100.0)
-                    shares = int(notional / result["entry_price"]) if result["entry_price"] else 0
+                    full_shares = int(notional / initial_price) if initial_price else 0
                 elif cfg.position_sizing_mode == "risk_pct_of_capital":
                     risk_dollars = max(equity, 0.0) * (cfg.risk_pct_of_capital / 100.0)
-                    shares = int(risk_dollars / result["risk_per_share"]) if result["risk_per_share"] else 0
+                    full_shares = int(risk_dollars / result["risk_per_share"]) if result["risk_per_share"] else 0
                 else:  # "fixed_dollars" (default, unchanged from before this existed)
-                    shares = int(cfg.position_size_dollars / result["entry_price"]) if result["entry_price"] else 0
+                    full_shares = int(cfg.position_size_dollars / initial_price) if initial_price else 0
 
-                pnl_dollars_gross = shares * result["pnl_per_share"]
+                fills = result.get("fills") or [{"time": result["entry_time"], "price": result["entry_price"], "size_frac": 1.0}]
+                month_key = d.strftime("%Y-%m")
+                prior_volume = monthly_shares.get(month_key, 0.0)
+
+                fill_rows = []
+                shares = 0
+                cost_basis_dollars = 0.0
+                commission_entry = 0.0
+                for f in fills:
+                    fill_shares = round(full_shares * f["size_frac"])
+                    if fill_shares <= 0:
+                        continue
+                    shares += fill_shares
+                    cost_basis_dollars += fill_shares * f["price"]
+                    if cfg.include_commissions:
+                        c = estimate_commission(fill_shares, f["price"], prior_volume)
+                        prior_volume += fill_shares
+                        commission_entry += c
+                    fill_rows.append({
+                        "time": f["time"].strftime("%H:%M:%S"),
+                        "price": f["price"],
+                        "shares": fill_shares,
+                    })
+
+                # blended average cost basis across every fill (identical to
+                # result["entry_price"] when there's only the one fill, since
+                # that's already how orb_strategy.py computed it -- recomputed
+                # here off the real rounded share counts instead of the raw
+                # size_frac weights, for penny-accurate $ P&L)
+                avg_entry_price = (cost_basis_dollars / shares) if shares else result["entry_price"]
+                pnl_dollars_gross = shares * (result["exit_price"] - avg_entry_price)
 
                 if cfg.include_commissions:
-                    month_key = d.strftime("%Y-%m")
-                    prior_volume = monthly_shares.get(month_key, 0.0)
-                    commission_entry = estimate_commission(shares, result["entry_price"], prior_volume)
-                    prior_volume += shares
                     commission_exit = estimate_commission(shares, result["exit_price"], prior_volume)
                     prior_volume += shares
                     monthly_shares[month_key] = prior_volume
@@ -212,7 +254,8 @@ def run_backtest(cfg: BacktestConfig, progress_cb=None, cancel_check=None) -> li
                     pnl_dollars = round(pnl_dollars_gross - commission_total, 2)
                     win = pnl_dollars > 0
                 else:
-                    commission_entry = commission_exit = commission_total = 0.0
+                    commission_exit = 0.0
+                    commission_total = 0.0
                     pnl_dollars = round(pnl_dollars_gross, 2)
                     win = result["win"]
 
@@ -221,15 +264,20 @@ def run_backtest(cfg: BacktestConfig, progress_cb=None, cancel_check=None) -> li
                     "symbol": symbol,
                     "gap_pct": round(float(row["gap_pct"]), 2),
                     "entry_time": result["entry_time"].strftime("%H:%M:%S"),
-                    "entry_price": result["entry_price"],
+                    "entry_price": round(avg_entry_price, 4),
                     "exit_time": result["exit_time"].strftime("%H:%M:%S"),
                     "exit_price": result["exit_price"],
                     "exit_reason": result["exit_reason"],
                     "stop_price": result["stop_price"],
                     "target_price": result["target_price"],
                     "shares": shares,
+                    # Every fill this trade actually made (just one unless
+                    # scale-in added more), with real share counts -- lets
+                    # the UI show "started 250, added 125 @ $11.00, added
+                    # 125 @ $11.20" instead of one opaque entry price.
+                    "fills": fill_rows,
                     "risk_per_share": result["risk_per_share"],
-                    "pnl_per_share": result["pnl_per_share"],
+                    "pnl_per_share": round(result["exit_price"] - avg_entry_price, 4),
                     "pnl_dollars_gross": round(pnl_dollars_gross, 2),
                     "commission_entry": round(commission_entry, 2),
                     "commission_exit": round(commission_exit, 2),
