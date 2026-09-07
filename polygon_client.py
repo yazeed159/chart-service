@@ -202,6 +202,34 @@ def find_top_gainers(d: date, top_n: int = 5, min_price: float = 1.0, max_price:
     return top[["open", "prior_close", "gap_pct", "volume"]]
 
 
+def build_candidate_universe(d: date, min_price: float = 1.0, max_price: float = 50.0,
+                              min_dollar_volume: float = 1_000_000, max_symbols: int = 2000) -> list[str]:
+    """One-call-a-day universe builder for scanner.py's live premarket poll.
+
+    NOT a live gap scan (that needs today's actual premarket price, which
+    Polygon's free tier can't give in real time -- see the free-tier
+    delayed-data caveat in this module's docstring). This just answers
+    "which ~1-2k tickers are even worth polling live tomorrow morning",
+    using trading day `d`'s (typically yesterday's) close/volume as a
+    liquidity + price-band filter. scanner.py then hits Alpaca's snapshot
+    endpoint against this shortlist for the actual live gap%.
+
+    Returns a plain list of symbols (dollar-volume descending, capped at
+    max_symbols so a single Alpaca snapshot call stays well under its
+    ~4000-symbol ceiling), or [] if `d` has no data (weekend/holiday --
+    caller should walk back a day, same as find_top_gainers does for its
+    prior-close lookup).
+    """
+    bars = _fetch_grouped_daily(d)
+    if bars.empty:
+        return []
+    df = bars[(bars["close"] >= min_price) & (bars["close"] <= max_price)].copy()
+    df["dollar_volume"] = df["close"] * df["volume"]
+    df = df[df["dollar_volume"] >= min_dollar_volume]
+    df = df.sort_values("dollar_volume", ascending=False).head(max_symbols)
+    return list(df.index)
+
+
 _bars_cache: dict = {}
 
 

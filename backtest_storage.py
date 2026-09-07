@@ -154,6 +154,23 @@ def load_backtest_history(user_id: str) -> list[dict]:
     ]
 
 
+def load_backtest_run_light(job_id: str, user_id: str) -> dict | None:
+    """Like load_backtest_report, but returns params/summary_stats instead
+    of the heavy report blob -- what POST /backtest/history/<job_id>/
+    save-strategy needs (a strategy is built from a run's params, not its
+    full trade-by-trade report). Filtered by id AND user_id."""
+    _require_config()
+    resp = requests.get(
+        f"{SUPABASE_URL}/rest/v1/{TABLE}",
+        headers=_headers(),
+        params={"select": "id,params,summary_stats", "id": f"eq.{job_id}", "user_id": f"eq.{user_id}", "limit": "1"},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    rows = resp.json()
+    return rows[0] if rows else None
+
+
 def load_backtest_report(job_id: str, user_id: str) -> dict | None:
     """Filtered by id AND user_id -- a valid job_id belonging to someone
     else's run returns None (the route below turns that into the same 404
