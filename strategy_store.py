@@ -24,7 +24,7 @@ Typically created via POST /backtest/history/<job_id>/save-strategy
 (chart_service.py), which copies entry_mode/params straight out of that
 run's stored `params` and lets the person confirm a symbol_rule. Read
 from both sides: chart_service.py (to list/edit strategies) and
-live-service/app.py, which imports this module directly rather than over
+live-service/live_app.py, which imports this module directly rather than over
 HTTP -- see docker-compose.yml's live-service volume mount of this repo
 read-only at /chart-service, the same trick engine.py already uses for
 `import orb_strategy`.
