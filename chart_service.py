@@ -2412,6 +2412,15 @@ def strategies_get_delete(strategy_id):
 
 
 import gappers_store
+import scanner_enrich
+
+# Starts a background thread (see scanner_enrich.py's module docstring for
+# why this can't just enrich inline inside the /gappers request) that
+# keeps the top SCANNER_ENRICH_MAX_ROWS gappers' float/RVol/VWAP/EMA/badges
+# refreshed, sharing this file's own Polygon rate limiter (_polygon_limiter)
+# so it can never push total Polygon usage past the plan's actual limit.
+import sys as _sys
+scanner_enrich.start(_sys.modules[__name__], gappers_store)
 
 
 # --- Live gappers: read-only view of scanner.py's premarket scan, for
@@ -2428,10 +2437,21 @@ def gappers_list():
         return err
     now_et = datetime.now(ET)
     session_active = now_et.weekday() < 5 and dtime(4, 0) <= now_et.time() < dtime(9, 30)
+    rows = gappers_store.list_todays_gappers(limit=50)
+    # Enrichment is additive and best-effort: a row whose enrichment
+    # hasn't landed yet (or falls past the top SCANNER_ENRICH_MAX_ROWS,
+    # which never gets enriched at all -- see scanner_enrich.py) just
+    # keeps these fields null; the frontend renders that as "—", not an
+    # error.
+    for row in rows:
+        extra = scanner_enrich.get_enrichment(row["symbol"])
+        if extra:
+            row.update(extra)
     return jsonify({
-        "rows": gappers_store.list_todays_gappers(limit=50),
+        "rows": rows,
         "server_time": now_et.isoformat(),
         "session_active": session_active,
+        "enrich_max_rows": scanner_enrich.MAX_ROWS,
     })
 
 
