@@ -1886,7 +1886,7 @@ def _add_cors_headers(resp):
     # well as from n8n -- CORS only matters for the browser calls, and is a
     # no-op for server-to-server ones, so it's safe to apply to every route.
     resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, ngrok-skip-browser-warning"
     return resp
 
@@ -2378,7 +2378,7 @@ def strategies_list_create():
     return jsonify(row)
 
 
-@app.route("/strategies/<strategy_id>", methods=["GET", "DELETE", "OPTIONS"])
+@app.route("/strategies/<strategy_id>", methods=["GET", "PUT", "DELETE", "OPTIONS"])
 def strategies_get_delete(strategy_id):
     if request.method == "OPTIONS":
         return "", 204
@@ -2388,6 +2388,23 @@ def strategies_get_delete(strategy_id):
     if request.method == "DELETE":
         strategy_store.delete_strategy(strategy_id, user_id)
         return jsonify({"deleted": strategy_id})
+    if request.method == "PUT":
+        # Edits an existing strategy's params/entry_mode/symbol_rule/name
+        # in place -- e.g. Live Trading's param editor saving changes
+        # "forever". Same row both the Backtester and Live Trading read,
+        # so this is also how a live-tuned param takes effect back in
+        # the Backtester next time this strategy is loaded there.
+        body = request.get_json(force=True, silent=True) or {}
+        row = strategy_store.update_strategy(
+            strategy_id, user_id,
+            name=body.get("name"),
+            entry_mode=body.get("entry_mode"),
+            params=body.get("params"),
+            symbol_rule=body.get("symbol_rule"),
+        )
+        if row is None:
+            return jsonify({"error": "not found"}), 404
+        return jsonify(row)
     row = strategy_store.get_strategy(strategy_id, user_id)
     if row is None:
         return jsonify({"error": "not found"}), 404

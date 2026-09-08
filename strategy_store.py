@@ -165,3 +165,50 @@ def delete_strategy(strategy_id: str, user_id: str):
     if resp.status_code >= 300:
         log.error("delete_strategy(%s) failed: %s %s", strategy_id, resp.status_code, resp.text[:500])
         resp.raise_for_status()
+
+
+def update_strategy(strategy_id: str, user_id: str, name: str | None = None,
+                     entry_mode: str | None = None, params: dict | None = None,
+                     symbol_rule: dict | None = None) -> dict | None:
+    """Patches an existing strategy row in place -- the "edit a strategy's
+    params and keep it forever" path (web-service's live-trading.js param
+    editor, and eventually a similar editor on the Backtester page). Only
+    the fields actually passed get overwritten; omit one to leave it as
+    is. Filtered by id AND user_id like get_strategy/delete_strategy --
+    patching someone else's strategy_id (or one that doesn't exist)
+    matches zero rows and this returns None rather than raising, so
+    callers can tell "not yours / doesn't exist" apart from a real HTTP
+    failure.
+
+    Because live-service imports this module directly (see the module
+    docstring), a strategy update here is picked up by any *future* live
+    run started from this strategy_id immediately -- there's no cache to
+    invalidate. It has no effect on a run already in progress, which
+    keeps whatever params it started with (see engine.start_run in the
+    live-trading-stack repo); stop and restart the run to pick up a
+    mid-flight param change.
+    """
+    _require_config()
+    row: dict = {}
+    if name is not None:
+        row["name"] = name
+    if entry_mode is not None:
+        row["entry_mode"] = entry_mode
+    if params is not None:
+        row["params"] = params
+    if symbol_rule is not None:
+        row["symbol_rule"] = symbol_rule
+    if not row:
+        return get_strategy(strategy_id, user_id)
+    resp = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/{TABLE}",
+        headers=_headers({"Prefer": "return=representation"}),
+        params={"id": f"eq.{strategy_id}", "user_id": f"eq.{user_id}"},
+        json=row,
+        timeout=15,
+    )
+    if resp.status_code >= 300:
+        log.error("update_strategy(%s) failed: %s %s", strategy_id, resp.status_code, resp.text[:500])
+        resp.raise_for_status()
+    rows = resp.json()
+    return rows[0] if rows else None
