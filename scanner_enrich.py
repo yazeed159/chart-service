@@ -1,7 +1,7 @@
 """
 scanner_enrich.py
 Adds the "Arcane Grimoire"-style per-symbol context (float, RVol, VWAP,
-EMA9/EMA20, day high, and a few threshold-based badges) on top of
+EMA9/EMA20/EMA200, day high, and a few threshold-based badges) on top of
 scanner.py's bare gap%/price/volume rows, for web-service's /scanner.html.
 
 WHY THIS ISN'T JUST compute_volume_float_stats() / get_full_day_bars()
@@ -127,6 +127,7 @@ def _enrich_one(symbol: str, cs) -> dict | None:
         vwap = float(latest["VWAP"]) if latest["VWAP"] == latest["VWAP"] else None  # NaN check
         ema9 = float(latest["EMA9"]) if latest["EMA9"] == latest["EMA9"] else None
         ema20 = float(latest["EMA20"]) if latest["EMA20"] == latest["EMA20"] else None
+        ema200 = float(latest["EMA200"]) if latest["EMA200"] == latest["EMA200"] else None
         day_high = float(session_only["High"].max())
 
         return {
@@ -134,6 +135,7 @@ def _enrich_one(symbol: str, cs) -> dict | None:
             "vwap": round(vwap, 4) if vwap is not None else None,
             "ema9": round(ema9, 4) if ema9 is not None else None,
             "ema20": round(ema20, 4) if ema20 is not None else None,
+            "ema200": round(ema200, 4) if ema200 is not None else None,
             "float_shares": float_shares,
             "float_tag": cs.classify_float(float_shares),
             "avg_volume_30d": vol_stats.get("avg_volume_30d"),

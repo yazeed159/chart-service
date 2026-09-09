@@ -20,13 +20,15 @@ Returns:
     "vwap_at_entry": 231.02,
     "ema9_at_entry": 230.88,
     "ema20_at_entry": 230.41,
+    "ema200_at_entry": 228.77,
     "macd_at_entry": 0.14,
     "macd_signal_at_entry": 0.09,
     "macd_hist_at_entry": 0.05,
     "macd_hist_prior_bar": 0.03,
     "entry_vs_vwap": "above",
     "entry_vs_ema9": "above",
-    "entry_vs_ema20": "above"
+    "entry_vs_ema20": "above",
+    "entry_vs_ema200": "above"
   },
   "bars": [                       # display-window OHLCV + indicators, one
                                    # object per minute, for the dashboard's
@@ -37,7 +39,7 @@ Returns:
     {
       "t": "2026-08-12T08:30:00",
       "o": 231.10, "h": 231.30, "l": 231.05, "c": 231.20, "v": 4231,
-      "vwap": 231.02, "ema9": 230.88, "ema20": 230.41,
+      "vwap": 231.02, "ema9": 230.88, "ema20": 230.41, "ema200": 228.77,
       "macd": 0.14, "macd_signal": 0.09, "macd_hist": 0.05
     },
     ...
@@ -51,9 +53,9 @@ volume can badly distort VWAP).
 Indicator accuracy notes:
   - VWAP resets at the 9:30 ET session open every trading day (a real
     "anchored" session VWAP), not from an arbitrary point mid-window.
-  - EMA9 / EMA20 / MACD are computed over a multi-day lookback so they have
-    a proper warm-up period before the display window, instead of being
-    seeded artificially at the first bar of the chart.
+  - EMA9 / EMA20 / EMA200 / MACD are computed over a multi-day lookback so
+    they have a proper warm-up period before the display window, instead of
+    being seeded artificially at the first bar of the chart.
 
 indicators also now carries (best-effort -- see VOLUME_FLOAT_STATS below):
   "volume_on_entry_day": 8213400,   # that trading day's TOTAL volume (not
@@ -933,6 +935,9 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     df["EMA9"] = df["Close"].ewm(span=9, adjust=False).mean()
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
+    # Same Close series, same ewm() call shape as EMA9/EMA20 above -- free to
+    # add alongside them, no extra data fetch or API call required.
+    df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
 
     ema12 = df["Close"].ewm(span=12, adjust=False).mean()
     ema26 = df["Close"].ewm(span=26, adjust=False).mean()
@@ -1010,6 +1015,7 @@ def serialize_bars(df: pd.DataFrame) -> list:
             "vwap": round(float(row["VWAP"]), 4),
             "ema9": round(float(row["EMA9"]), 4),
             "ema20": round(float(row["EMA20"]), 4),
+            "ema200": round(float(row["EMA200"]), 4),
             "macd": round(float(row["MACD"]), 4),
             "macd_signal": round(float(row["MACD_signal"]), 4),
             "macd_hist": round(float(row["MACD_hist"]), 4),
@@ -1018,7 +1024,7 @@ def serialize_bars(df: pd.DataFrame) -> list:
 
 
 def render_chart(df: pd.DataFrame, symbol: str, entry_dt, exit_dt, entry_price, exit_price,
-                  vwap_at_entry, ema9_at_entry, ema20_at_entry,
+                  vwap_at_entry, ema9_at_entry, ema20_at_entry, ema200_at_entry,
                   stop_price=None, target_price=None,
                   better_entry=None, better_exit=None) -> bytes:
     # Histogram bars colored per-bar: green when positive, red when negative.
@@ -1036,6 +1042,7 @@ def render_chart(df: pd.DataFrame, symbol: str, entry_dt, exit_dt, entry_price, 
         mpf.make_addplot(df["VWAP"], color="orange", width=1.3),
         mpf.make_addplot(df["EMA9"], color="gray", width=1.0),
         mpf.make_addplot(df["EMA20"], color="blue", width=1.0),
+        mpf.make_addplot(df["EMA200"], color="purple", width=1.0),
     ]
 
     style = mpf.make_mpf_style(base_mpf_style="yahoo", gridstyle="")
@@ -1050,7 +1057,7 @@ def render_chart(df: pd.DataFrame, symbol: str, entry_dt, exit_dt, entry_price, 
         return _render_chart_locked(
             df, symbol, entry_dt, exit_dt, entry_price, exit_price,
             macd_panel, overlays, style,
-            vwap_at_entry, ema9_at_entry, ema20_at_entry,
+            vwap_at_entry, ema9_at_entry, ema20_at_entry, ema200_at_entry,
             stop_price, target_price, better_entry, better_exit,
         )
     finally:
@@ -1059,7 +1066,7 @@ def render_chart(df: pd.DataFrame, symbol: str, entry_dt, exit_dt, entry_price, 
 
 def _render_chart_locked(df, symbol, entry_dt, exit_dt, entry_price, exit_price,
                           macd_panel, overlays, style,
-                          vwap_at_entry, ema9_at_entry, ema20_at_entry,
+                          vwap_at_entry, ema9_at_entry, ema20_at_entry, ema200_at_entry,
                           stop_price=None, target_price=None,
                           better_entry=None, better_exit=None) -> bytes:
     """Everything here runs with RENDER_LOCK held -- see render_chart()."""
@@ -1089,19 +1096,20 @@ def _render_chart_locked(df, symbol, entry_dt, exit_dt, entry_price, exit_price,
     price_ax.grid(True, which="major", axis="x", linestyle="--", linewidth=0.4, color="#cccccc", alpha=0.25)
 
     # mplfinance addplots don't auto-populate a legend — build one explicitly.
-    # The line color itself is enough to tell VWAP/EMA9/EMA20 apart, so the
-    # label just carries each one's price at entry instead of spelling out
-    # the color or the VWAP session-reset note.
+    # The line color itself is enough to tell VWAP/EMA9/EMA20/EMA200 apart,
+    # so the label just carries each one's price at entry instead of
+    # spelling out the color or the VWAP session-reset note.
     legend_lines = [
         Line2D([0], [0], color="orange", lw=1.3, label=f"VWAP  ${vwap_at_entry:.2f}"),
         Line2D([0], [0], color="gray", lw=1.0, label=f"EMA 9  ${ema9_at_entry:.2f}"),
         Line2D([0], [0], color="blue", lw=1.0, label=f"EMA 20  ${ema20_at_entry:.2f}"),
+        Line2D([0], [0], color="purple", lw=1.0, label=f"EMA 200  ${ema200_at_entry:.2f}"),
     ]
     # Placed above the axes (not inside upper-left corner) so it can never
     # collide with the entry/exit labels, which also live near the top.
     price_ax.legend(
         handles=legend_lines, loc="lower center", bbox_to_anchor=(0.5, 1.01),
-        ncol=3, fontsize=8, framealpha=0.9, borderaxespad=0,
+        ncol=4, fontsize=8, framealpha=0.9, borderaxespad=0,
     )
 
     entry_x = df.index.get_indexer([entry_dt], method="nearest")[0]
@@ -1333,6 +1341,7 @@ def _build_chart_response(body, start):
             vwap_at_entry=float(at_entry["VWAP"]),
             ema9_at_entry=float(at_entry["EMA9"]),
             ema20_at_entry=float(at_entry["EMA20"]),
+            ema200_at_entry=float(at_entry["EMA200"]),
             stop_price=stop_for_chart, target_price=target_for_chart,
             better_entry=better_entry, better_exit=better_exit,
         )
@@ -1346,6 +1355,7 @@ def _build_chart_response(body, start):
         "vwap_at_entry": round(float(at_entry["VWAP"]), 4),
         "ema9_at_entry": round(float(at_entry["EMA9"]), 4),
         "ema20_at_entry": round(float(at_entry["EMA20"]), 4),
+        "ema200_at_entry": round(float(at_entry["EMA200"]), 4),
         "macd_at_entry": round(float(at_entry["MACD"]), 4),
         "macd_signal_at_entry": round(float(at_entry["MACD_signal"]), 4),
         "macd_hist_at_entry": round(float(at_entry["MACD_hist"]), 4),
@@ -1353,6 +1363,7 @@ def _build_chart_response(body, start):
         "entry_vs_vwap": "above" if entry_price > at_entry["VWAP"] else "below",
         "entry_vs_ema9": "above" if entry_price > at_entry["EMA9"] else "below",
         "entry_vs_ema20": "above" if entry_price > at_entry["EMA20"] else "below",
+        "entry_vs_ema200": "above" if entry_price > at_entry["EMA200"] else "below",
         "setup_type": levels["setup_type"],
         "stop_price": levels["stop_price"],
         "target_price": levels["target_price"],

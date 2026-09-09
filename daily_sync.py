@@ -300,6 +300,8 @@ def _indicator_summary(chart: dict | None) -> str:
         f"- VWAP: ${fmt(indicators.get('vwap_at_entry'))} (entry is {indicators.get('entry_vs_vwap', 'n/a')} VWAP)",
         f"- EMA9: ${fmt(indicators.get('ema9_at_entry'))} (entry is {indicators.get('entry_vs_ema9', 'n/a')} EMA9)",
         f"- EMA20: ${fmt(indicators.get('ema20_at_entry'))} (entry is {indicators.get('entry_vs_ema20', 'n/a')} EMA20)",
+        f"- EMA200: ${fmt(indicators.get('ema200_at_entry'))} (entry is {indicators.get('entry_vs_ema200', 'n/a')} EMA200 -- "
+        f"longer-term trend context only, not part of the dip-buy/breakout criteria below)",
         f"- MACD: {fmt(indicators.get('macd_at_entry'), 4)}, Signal: {fmt(indicators.get('macd_signal_at_entry'), 4)}, "
         f"Histogram: {fmt(indicators.get('macd_hist_at_entry'), 4)} (prior bar: {fmt(indicators.get('macd_hist_prior_bar'), 4)})",
         f"- Service-computed setup_type guess: {indicators.get('setup_type', 'n/a')}",
