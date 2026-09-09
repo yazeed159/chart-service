@@ -7,20 +7,26 @@ Writes today's qualifying gappers to Supabase via gappers_store.py;
 live-service reads them back through gappers_store.get_symbols_for_rule().
 
 --------------------------------------------------------------------------
-WHY THIS ISN'T PART OF chart_service.py's WEB SERVICE
+UPDATE: RUNS AS AN IN-PROCESS BACKGROUND THREAD, NOT A SEPARATE CRON JOB
 --------------------------------------------------------------------------
-This needs to poll continuously for the ~5.5 hours of the premarket
-session (4:00-9:30 ET), not respond to a request. Bundling that into the
-always-on Flask process would mean either blocking a worker for 5.5
-hours or juggling a background thread that has to survive redeploys --
-messier than it needs to be. Instead this is a standalone script, run as
-its OWN Render Cron Job (separate service, same repo -- start command
-`python scanner.py`, schedule `55 8 * * 1-5` UTC, i.e. 3:55 AM ET
-weekdays, since cron time is UTC and ET is UTC-5 or UTC-4 depending on
-DST -- adjust if you want to be precise across the DST boundary, a few
-minutes early/late doesn't matter much). It runs until 9:30 ET, then
-exits on its own, which is exactly what a cron job is for -- no
-Background Worker (paid tier) needed.
+Originally this was meant to run as its own Render Cron Job (see git
+history) so the ~5.5 hour premarket poll wouldn't block a Flask worker.
+Render Cron Jobs are not on the free tier though (billed per minute, ~$1/mo
+minimum even for a light job), so this now runs the same way
+scanner_enrich.py already does: a daemon thread started once from
+chart_service.py at import time (see start(), same shape as
+scanner_enrich.start()), living inside chart-service's existing free web
+service. No second paid service needed.
+
+The tradeoff this reintroduces (that a separate Cron Job would have
+avoided): a free Render web service spins down after ~15 min with no
+inbound HTTP traffic, which kills this thread along with the rest of the
+process. A redeploy also restarts the thread from scratch (harmless --
+_build_universe just reruns). To keep the service alive through the
+4:00-9:30 ET premarket window, point a free uptime pinger (e.g.
+cron-job.org or UptimeRobot, both free) at chart-service's GET /health
+every 5-10 minutes. That's the free-tier price of not paying for a Cron
+Job: an external, zero-cost keepalive instead.
 
 --------------------------------------------------------------------------
 WHY PREMARKET ONLY, AND WHY THIS STAYS ON ALPACA'S FREE PLAN
@@ -50,11 +56,13 @@ DATA FLOW
    gappers_store.get_symbols_for_rule, against whatever thresholds that
    strategy's symbol_rule actually specifies), upsert the top N.
 
-Env vars (new, set on the Cron Job service specifically -- it does NOT
-inherit chart-service's web service env vars just because it's the same
-repo):
-  POLYGON_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY  - reused
-  ALPACA_API_KEY_ID, ALPACA_API_SECRET_KEY                  - new
+Env vars (set on chart-service itself, same service as everything else in
+this file's docstring history -- no separate service to configure now):
+  POLYGON_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY  - already set
+    for chart-service's other routes, reused here as-is
+  ALPACA_API_KEY_ID, ALPACA_API_SECRET_KEY                  - new, add
+    these to chart-service's existing env vars (free Alpaca account, IEX
+    feed -- see alpaca_client.py)
   SCANNER_POLL_INTERVAL_S   - default 5. Well within Alpaca's free-tier
     200 calls/min (~1-2 calls per cycle -- this could go lower still, but
     5s is already close to the floor of what matters: the IEX feed itself
@@ -76,6 +84,7 @@ from __future__ import annotations
 import os
 import time
 import logging
+import threading
 from datetime import date, timedelta, datetime, time as dtime
 from zoneinfo import ZoneInfo
 
@@ -97,6 +106,9 @@ TOP_N = int(os.environ.get("SCANNER_TOP_N", 50))
 
 SESSION_START = dtime(4, 0)   # premarket open, ET
 SESSION_END = dtime(9, 30)    # regular-session open, ET -- see module docstring
+
+IDLE_CHECK_S = 60  # how often the thread wakes up to recheck the session
+                    # window while outside it -- cheap, no API calls made
 
 
 def _build_universe(today: date) -> list[str]:
@@ -143,32 +155,63 @@ def _poll_once(today: date, universe: list[str]):
               len(rows), len(universe), [r["symbol"] for r in rows[:5]])
 
 
-def run():
-    now = datetime.now(ET)
-    today = now.date()
-    if today.weekday() >= 5:
-        log.info("Weekend, nothing to do.")
-        return
-    session_end_dt = datetime.combine(today, SESSION_END, tzinfo=ET)
-    if now.time() >= SESSION_END:
-        log.info("Started after %s ET session end -- nothing to do today.", SESSION_END)
-        return
+_started = False
+_start_lock = threading.Lock()
 
-    universe = _build_universe(today)
+# Cache the day's candidate universe so re-entering the session window
+# (e.g. after a Render redeploy mid-morning) doesn't rebuild it from
+# scratch every time -- built once per calendar day, on first use.
+_universe_cache_date: date | None = None
+_universe_cache: list[str] = []
 
+
+def _get_universe(today: date) -> list[str]:
+    global _universe_cache_date, _universe_cache
+    if _universe_cache_date != today:
+        _universe_cache = _build_universe(today)
+        _universe_cache_date = today
+    return _universe_cache
+
+
+def _loop():
+    """Runs forever as a daemon thread (see start()). Unlike the old
+    standalone-script run(), this never exits -- it just idles at
+    IDLE_CHECK_S outside the session window and resumes polling the next
+    time SESSION_START-SESSION_END rolls around, so one thread covers
+    every trading day the process happens to be alive for."""
     while True:
-        now = datetime.now(ET)
-        if now >= session_end_dt:
-            log.info("Reached %s ET -- session over, exiting.", SESSION_END)
-            return
-        cycle_start = time.monotonic()
+        sleep_s = IDLE_CHECK_S
         try:
-            _poll_once(today, universe)
+            now = datetime.now(ET)
+            today = now.date()
+            in_session = today.weekday() < 5 and SESSION_START <= now.time() < SESSION_END
+            if in_session:
+                cycle_start = time.monotonic()
+                universe = _get_universe(today)
+                _poll_once(today, universe)
+                elapsed = time.monotonic() - cycle_start
+                sleep_s = max(0.0, POLL_INTERVAL_S - elapsed)
         except Exception:
-            log.exception("Poll cycle failed -- continuing to next cycle")
-        elapsed = time.monotonic() - cycle_start
-        time.sleep(max(0.0, POLL_INTERVAL_S - elapsed))
+            log.exception("Scanner loop iteration failed -- continuing")
+        time.sleep(sleep_s)
+
+
+def start():
+    """Idempotent -- call this from chart_service.py once, at import time
+    (same pattern as scanner_enrich.start()). Safe to call more than once
+    (e.g. under a dev-server reloader); only the first call spawns the
+    thread."""
+    global _started
+    with _start_lock:
+        if _started:
+            return
+        _started = True
+    threading.Thread(target=_loop, daemon=True, name="gap-scanner").start()
+    log.info("Gap scanner thread started (poll=%.0fs, session=%s-%s ET)",
+              POLL_INTERVAL_S, SESSION_START, SESSION_END)
 
 
 if __name__ == "__main__":
-    run()
+    # Still runnable standalone (e.g. local testing) -- just runs the loop
+    # in the foreground instead of as a background thread.
+    _loop()

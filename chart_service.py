@@ -2424,6 +2424,7 @@ def strategies_get_delete(strategy_id):
 
 import gappers_store
 import scanner_enrich
+import scanner
 
 # Starts a background thread (see scanner_enrich.py's module docstring for
 # why this can't just enrich inline inside the /gappers request) that
@@ -2432,6 +2433,23 @@ import scanner_enrich
 # so it can never push total Polygon usage past the plan's actual limit.
 import sys as _sys
 scanner_enrich.start(_sys.modules[__name__], gappers_store)
+
+# Starts the actual premarket gap scan itself as a second background
+# thread -- see scanner.py's module docstring for why this now runs
+# in-process here instead of as a separate (paid) Render Cron Job, and
+# why that means chart-service needs to be kept awake through the
+# 4:00-9:30 ET window via a free external pinger against GET /health.
+scanner.start()
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    # Deliberately unauthenticated and cheap -- this exists only so a
+    # free uptime pinger (cron-job.org, UptimeRobot, etc.) can hit it
+    # every few minutes to stop Render's free tier from spinning this
+    # service down, which would otherwise kill the scanner.py and
+    # scanner_enrich.py background threads along with it.
+    return jsonify({"ok": True})
 
 
 # --- Live gappers: read-only view of scanner.py's premarket scan, for
