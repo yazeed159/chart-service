@@ -1,0 +1,41 @@
+name: Run scanner
+
+on:
+  schedule:
+    # Every 5 minutes, Mon–Fri, during roughly 9:30am–4:00pm US/Eastern.
+    # GitHub cron times are UTC. Eastern is UTC-4 (EDT) most of the year and
+    # UTC-5 (EST) in winter — this uses UTC-4, so it'll run ~1hr early/late
+    # for a few weeks around the DST changeovers. Adjust if that matters to you.
+    - cron: '*/5 13-20 * * 1-5'
+  workflow_dispatch: {}   # lets you manually trigger a run from the Actions tab, for testing
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10   # safety net so a hung run doesn't burn minutes forever
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run scanner
+        env:
+          # Add each secret here, then add the actual value under
+          # Settings → Secrets and variables → Actions → New repository secret.
+          # Names below are guesses based on your other tabs (Alpaca, Finnhub) —
+          # rename to match whatever scanner.py actually reads via os.environ.
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+        run: python scanner.py
