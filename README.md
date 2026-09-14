@@ -7,7 +7,7 @@ replaced, but there's no n8n in the loop anymore.
 
 ## Routes
 
-**Chart generation** (`chart_service.py`)
+**Chart generation** (`charts.py` + `market_data.py`)
 - `POST /generate-chart` — VWAP/EMA9/EMA20/MACD at entry + a minute-bar
   window for one trade, plus best-effort volume/float context
   (`avg_volume_30d`, `relative_volume`, `float_shares`). Source: Polygon.io
@@ -21,7 +21,7 @@ replaced, but there's no n8n in the loop anymore.
   back" and "couldn't reach the server" the same way (falls back to
   simulated ticks).
 
-**Backtester** (`chart_service.py` + `engine.py` / `orb_strategy.py` /
+**Backtester** (`backtest_routes.py` + `engine.py` / `orb_strategy.py` /
 `polygon_client.py`) — auth-gated (`Authorization: Bearer <supabase token>`)
 - `POST /backtest/start` → `{job_id}`; `GET /backtest/status/<job_id>`
   (poll); `GET /backtest/defaults`; `GET|DELETE /backtest/history[/<job_id>]`;
