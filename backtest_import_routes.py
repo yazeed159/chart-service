@@ -51,9 +51,12 @@ NOT included: FIFO trade-matching (trade_matching.py) or the vision-LLM
 verdict step -- neither applies to backtest trades, see above.
 """
 
+import os
+import re
 import time
 import logging
 import threading
+from urllib.parse import urlparse
 
 import requests
 from flask import Blueprint, request, jsonify
@@ -65,6 +68,31 @@ bp = Blueprint("backtest_import_routes", __name__)
 # { batchSize: 1, batchInterval: 13000 }.
 CHART_PACING_SECONDS = 13
 CALLBACK_TIMEOUT_S = 30
+
+# SSRF guard. /backtest-import takes a caller-supplied run.callback_url and the
+# server later POSTs enriched trades to it. Left unchecked, anyone could make
+# this service send requests to arbitrary hosts (internal services, cloud
+# metadata endpoints, third parties). The only legitimate target is this
+# service's own /backtest/history/<job_id>/enrich route, so accept only that
+# path, on this service's own host (or a host listed in
+# BACKTEST_CALLBACK_ALLOWED_HOSTS, comma-separated, for setups where the
+# callback is served under a different public hostname).
+_CALLBACK_PATH_RE = re.compile(r"^/backtest/history/[0-9a-fA-F]+/enrich$")
+
+
+def callback_url_ok(url: str, own_host: str) -> bool:
+    try:
+        u = urlparse(str(url))
+    except ValueError:
+        return False
+    if u.scheme not in ("http", "https") or not u.hostname:
+        return False
+    if u.username or u.password or not _CALLBACK_PATH_RE.match(u.path):
+        return False
+    allowed = {h.strip().lower() for h in os.environ.get("BACKTEST_CALLBACK_ALLOWED_HOSTS", "").split(",") if h.strip()}
+    allowed.add((own_host or "").lower())
+    host = u.netloc.lower()
+    return host in allowed or (u.hostname or "").lower() in allowed
 
 
 def _run_backtest_import(run: dict, trades: list):
@@ -134,7 +162,7 @@ def _run_backtest_import(run: dict, trades: list):
         return
 
     try:
-        resp = requests.post(callback_url, json={"trades": out_trades}, timeout=CALLBACK_TIMEOUT_S)
+        resp = requests.post(callback_url, json={"trades": out_trades}, timeout=CALLBACK_TIMEOUT_S, allow_redirects=False)
         resp.raise_for_status()
         log.info("backtest-import job %s: callback delivered for %d trades", job_id, len(out_trades))
     except Exception as e:
@@ -154,6 +182,9 @@ def backtest_import():
         return jsonify({"error": "no trades in request body"}), 400
     if not run.get("callback_url"):
         return jsonify({"error": "run.callback_url is required"}), 400
+    if not callback_url_ok(run["callback_url"], request.host):
+        log.warning("backtest-import: rejected callback_url %r (host %r)", run.get("callback_url"), request.host)
+        return jsonify({"error": "run.callback_url must point at this service's /backtest/history/<job_id>/enrich"}), 400
 
     th = threading.Thread(target=_run_backtest_import, args=(run, trades), daemon=True)
     th.start()

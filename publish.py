@@ -99,6 +99,7 @@ def prepare_trade_payload(trade: dict) -> dict:
     bars = trade.get("_final_bars")
     user_id = trade.get("_user_id")
     broker_account_id = trade.get("_broker_account_id")
+    account_id = trade.get("_account_id")
 
     if not indicators or not bars:
         return {
@@ -167,6 +168,11 @@ def prepare_trade_payload(trade: dict) -> dict:
         "relative_volume": indicators.get("relative_volume"),
     }
 
+    # Only send account_id when we actually have one: before 001_accounts.sql
+    # has been run the column doesn't exist, and PostgREST rejects unknown keys.
+    if account_id:
+        index_row["account_id"] = account_id
+
     return {
         "_skip": False, "id": trade_id, "user_id": user_id, "broker_account_id": broker_account_id,
         "detail": detail, "index_row": index_row,
@@ -222,27 +228,74 @@ def _get_user_trades(user_id) -> list[dict]:
     return resp.json()
 
 
+def default_live_account_id(user_id):
+    """The user's oldest active real account (the "Main account" the SQL
+    migration / frontend creates), or None. Used when a trade arrives
+    without an explicit account."""
+    try:
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/accounts",
+            params={"user_id": f"eq.{user_id}", "kind": "eq.live", "status": "eq.active",
+                    "select": "id", "order": "created_at.asc", "limit": "1"},
+            headers=_supabase_headers(), timeout=15,
+        )
+        resp.raise_for_status()
+        rows = resp.json()
+        return rows[0]["id"] if rows else None
+    except (requests.RequestException, ValueError, KeyError, IndexError) as e:
+        # accounts table missing (migration not run yet) or transient error:
+        # fall back to "no account", i.e. the pre-accounts behavior.
+        log.warning("default_live_account_id failed for user %s: %s", user_id, e)
+        return None
+
+
+def resolve_account_id(user_id, requested):
+    """Validate a client-supplied account id: it must be one of THIS user's
+    real accounts. Anything else (missing, someone else's, a paper account)
+    falls back to the user's default real account."""
+    if requested:
+        try:
+            resp = requests.get(
+                f"{SUPABASE_URL}/rest/v1/accounts",
+                params={"id": f"eq.{requested}", "user_id": f"eq.{user_id}", "kind": "eq.live", "select": "id"},
+                headers=_supabase_headers(), timeout=15,
+            )
+            if resp.status_code == 200 and resp.json():
+                return requested
+        except (requests.RequestException, ValueError):
+            pass
+    return default_live_account_id(user_id)
+
+
 def _merge_and_upsert_trades(user_id, confirmed_index_rows: list[dict]) -> bool:
     """Fetches the user's existing trades, merges in the newly-confirmed
-    rows by id, recomputes running equity_after over the FULL merged,
-    date-sorted history, and upserts the merged set. Returns True on
-    200/201 (mirrors 'Index Update OK?'). See module docstring for the
-    bug this replaces."""
+    rows by id, recomputes running equity_after PER ACCOUNT over each
+    account's full date-sorted history, and upserts the merged set. Returns
+    True on 200/201 (mirrors 'Index Update OK?'). See module docstring for
+    the bug this replaces."""
     try:
         existing = _get_user_trades(user_id)
     except requests.RequestException as e:
         log.error("Get User Trades failed for user %s: %s", user_id, e)
         return False
 
+    default_acct = default_live_account_id(user_id)
     by_id = {row["id"]: row for row in existing}
     for row in confirmed_index_rows:
+        if not row.get("account_id"):
+            # keep the account a re-synced trade already had; else the default
+            # (skipped entirely if neither exists, e.g. migration not run yet)
+            keep = (by_id.get(row["id"]) or {}).get("account_id") or default_acct
+            if keep:
+                row["account_id"] = keep
         by_id[row["id"]] = row
     merged = sorted(by_id.values(), key=lambda r: (r.get("trade_date") or "", r.get("entry_time") or ""))
 
-    equity = 0.0
+    equity_by_account = {}
     for row in merged:
-        equity += row.get("pnl_after_comm") or 0
-        row["equity_after"] = round(equity, 2)
+        key = row.get("account_id") or default_acct
+        equity_by_account[key] = equity_by_account.get(key, 0.0) + (row.get("pnl_after_comm") or 0)
+        row["equity_after"] = round(equity_by_account[key], 2)
 
     try:
         resp = requests.post(

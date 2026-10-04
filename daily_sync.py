@@ -431,6 +431,62 @@ _VERDICT_PARSE_ERROR_FALLBACK = {
 }
 
 
+_BETTER_ENTRY_FIELDS = ("better_entry_price", "better_entry_time", "better_entry_reason", "better_entry_how_to_know")
+_BETTER_EXIT_FIELDS = ("better_exit_price", "better_exit_time", "better_exit_reason", "better_exit_how_to_know")
+
+
+def _parse_bar_timestamp(value):
+    """Best-effort parse of a better_entry_time/better_exit_time string
+    into a naive datetime for ordering comparisons only. These are
+    supposed to be copied verbatim from serialize_bars' "t" field
+    (%Y-%m-%dT%H:%M:%S -- see _bar_table_for_prompt), but the model can
+    still hand back something slightly off (a space instead of "T", no
+    seconds), so this tries a couple of reasonable fallbacks rather than
+    just giving up. Returns None if it truly can't be parsed."""
+    if not value:
+        return None
+    text = str(value).strip()
+    for candidate in (text, text.replace(" ", "T", 1)):
+        try:
+            return datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+    return None
+
+
+def _enforce_better_entry_before_exit(verdict: dict, trade: dict) -> dict:
+    """Gemini is prompted to propose better_entry_time and
+    better_exit_time independently (see _build_verdict_prompt), and
+    nothing about that prompt stops it from picking a "better entry"
+    timestamp that's chronologically AFTER its own "better exit"
+    timestamp -- an entry that happens after the trade has already been
+    exited is nonsensical, but the model has no structural reason not to
+    do it, and _apply_verdict/charts.py just plot whatever comes back.
+    That's what shows up on the trade chart as a better-entry marker
+    sitting to the right of (or on) the better-exit marker.
+
+    Belt-and-suspenders check here, after parsing and before this
+    verdict is used anywhere: if both times are present and parseable
+    and entry >= exit, the pair is broken and we can't tell which half
+    the model got wrong -- so drop both rather than ship a marker pair
+    that contradicts itself on the chart. Logged so bad Gemini responses
+    are visible instead of silently discarded.
+    """
+    entry_time = verdict.get("better_entry_time")
+    exit_time = verdict.get("better_exit_time")
+    entry_ts = _parse_bar_timestamp(entry_time)
+    exit_ts = _parse_bar_timestamp(exit_time)
+    if entry_ts is not None and exit_ts is not None and entry_ts >= exit_ts:
+        log.warning(
+            "Discarding better-entry/exit for %s %s: proposed better_entry_time %r "
+            "is not before proposed better_exit_time %r",
+            trade.get("Symbol"), trade.get("Trade Date"), entry_time, exit_time,
+        )
+        for field in _BETTER_ENTRY_FIELDS + _BETTER_EXIT_FIELDS:
+            verdict[field] = None
+    return verdict
+
+
 def _normalize_lessons(raw) -> list:
     """Gemini's response_mime_type: application/json guarantees valid JSON
     overall, but not that nested objects STAY objects -- each element of
@@ -503,6 +559,7 @@ def _get_verdict(trade: dict, indicator_summary: str, cached_symbol_info: dict |
         verdict = dict(_VERDICT_PARSE_ERROR_FALLBACK)
         verdict["reasoning"] = f"Could not parse Gemini response: {e}"
     verdict["lessons"] = _normalize_lessons(verdict.get("lessons"))
+    verdict = _enforce_better_entry_before_exit(verdict, trade)
 
     if cached_symbol_info is not None:
         verdict["symbol_name"] = cached_symbol_info.get("name") or ""
@@ -696,6 +753,17 @@ def _run_and_save(job_id: str):
     log.info("daily-sync job %s: done, %d accounts, %d trades -> %s", job_id, len(result["accounts"]), total_trades, out_path)
 
 
+# Shared secret for /daily-sync. The endpoint runs the whole pipeline for EVERY
+# user (their IBKR Flex tokens, Polygon, the LLM) and the service URL is public
+# (it's in the site's config.js), so it must not be triggerable by anyone who
+# knows the URL. Set DAILY_SYNC_SECRET in Render and the same value as a GitHub
+# Actions secret; the workflow sends it as the X-Sync-Token header.
+# If the env var isn't set yet the endpoint stays open (so an existing
+# deployment doesn't silently stop syncing) but logs a warning on every call.
+DAILY_SYNC_SECRET = os.environ.get("DAILY_SYNC_SECRET", "")
+_daily_sync_lock = threading.Lock()
+
+
 @bp.route("/daily-sync", methods=["POST"])
 def daily_sync():
     """Fires the whole pipeline in a background thread and returns
@@ -703,9 +771,38 @@ def daily_sync():
     ~13s chart pacing x Gemini call latency), well past what Render's
     request proxy or a GitHub Actions HTTP step would wait for. Inspect
     DAILY_SYNC_RUNS_DIR/<job_id>.json once it's done; part 2 will replace
-    that file-write with the real Sheets/Telegram/Supabase publish."""
+    that file-write with the real Sheets/Telegram/Supabase publish.
+
+    Guarded by DAILY_SYNC_SECRET (X-Sync-Token header) and allows only one
+    run at a time -- see the comment above DAILY_SYNC_SECRET."""
+    import hmac
+    from flask import request
+    if DAILY_SYNC_SECRET:
+        supplied = request.headers.get("X-Sync-Token", "")
+        if not hmac.compare_digest(supplied.encode(), DAILY_SYNC_SECRET.encode()):
+            log.warning("daily-sync: rejected request with missing/invalid X-Sync-Token")
+            return jsonify({"error": "unauthorized"}), 401
+    else:
+        log.warning("daily-sync: DAILY_SYNC_SECRET is not set -- endpoint is UNPROTECTED")
+
+    # One run at a time: overlapping runs double-hit IBKR Flex (which rate-limits
+    # and can invalidate a token) and race on the equity_after recompute.
+    if not _daily_sync_lock.acquire(blocking=False):
+        return jsonify({"error": "a daily sync is already running"}), 409
+
     job_id = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    th = threading.Thread(target=_run_and_save, args=(job_id,), daemon=True)
-    th.start()
+
+    def _run_then_release(jid):
+        try:
+            _run_and_save(jid)
+        finally:
+            _daily_sync_lock.release()
+
+    try:
+        th = threading.Thread(target=_run_then_release, args=(job_id,), daemon=True)
+        th.start()
+    except Exception:
+        _daily_sync_lock.release()
+        raise
     log.info("daily-sync job %s: started", job_id)
     return jsonify({"started": job_id}), 202

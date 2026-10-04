@@ -189,7 +189,9 @@ def import_trades():
 
     raw_executions = parse_csv_executions(valid_rows)
     try:
-        closed_trades = fifo_match_and_merge(raw_executions, account={"user_id": user_id})
+        from publish import resolve_account_id  # lazy import, same pattern as elsewhere in this service
+        target_account = resolve_account_id(user_id, (request.form.get("account_id") or "").strip() or None)
+        closed_trades = fifo_match_and_merge(raw_executions, account={"user_id": user_id, "account_id": target_account})
     except Exception as e:
         log.error("import-trades: FIFO matching failed: %s", e)
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500

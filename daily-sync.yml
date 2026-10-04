@@ -19,8 +19,10 @@ jobs:
       - name: POST /daily-sync
         run: |
           curl -sS -X POST "${RENDER_SERVICE_URL}/daily-sync" \
+            -H "X-Sync-Token: ${DAILY_SYNC_SECRET}" \
             -w "\nHTTP %{http_code}\n" \
             --max-time 30 \
             --retry 3 --retry-delay 10
         env:
           RENDER_SERVICE_URL: ${{ secrets.RENDER_SERVICE_URL }}
+          DAILY_SYNC_SECRET: ${{ secrets.DAILY_SYNC_SECRET }}
