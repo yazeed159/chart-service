@@ -23,7 +23,14 @@ Env vars:
   ALPACA_DATA_FEED        - default "iex" (free tier). Only override to
                              "sip" if you've actually upgraded to a paid
                              market-data plan -- "sip" on a free-tier key
-                             just 403s.
+                             just 403s. (Applies to the real-time snapshot
+                             calls only -- see get_minute_bars below.)
+  ALPACA_BARS_FEED        - feed for HISTORICAL minute bars (chart data).
+                             Default "sip": on the free plan the full-market
+                             SIP feed IS allowed for any bar whose window ends
+                             at least 15 minutes ago, so charts for yesterday's
+                             premarket get consolidated-tape bars, not the
+                             ~2-3% IEX-only subset.
 """
 
 from __future__ import annotations
@@ -82,3 +89,49 @@ def get_snapshots(symbols: list[str]) -> dict[str, dict]:
             resp.raise_for_status()
         out.update(resp.json() or {})
     return out
+
+
+BARS_FEED = os.environ.get("ALPACA_BARS_FEED", "sip")
+
+
+def available() -> bool:
+    return bool(API_KEY_ID and API_SECRET_KEY)
+
+
+def get_minute_bars(symbol: str, start_utc, end_utc) -> list[dict]:
+    """Historical 1-minute bars (pre-market through after-hours) for one
+    symbol, split-adjusted, oldest first. start_utc/end_utc are tz-aware
+    datetimes. On the free plan `end_utc` must be >= 15 minutes in the past
+    for feed=sip (caller clamps it). Pages through next_page_token. Raises
+    on HTTP errors with Alpaca's own message so it can be shown to the user.
+    Returns [] when Alpaca simply has no bars in that range."""
+    import time as _time
+    _require_key()
+    bars: list[dict] = []
+    params = {
+        "timeframe": "1Min",
+        "start": start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "end": end_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "limit": 10000, "adjustment": "split", "feed": BARS_FEED, "sort": "asc",
+    }
+    for _page in range(20):
+        for attempt in range(3):
+            resp = requests.get(
+                f"{DATA_BASE_URL}/stocks/{symbol}/bars",
+                headers=_headers(), params=params, timeout=20,
+            )
+            if resp.status_code == 429 and attempt < 2:
+                _time.sleep(2 * (attempt + 1))
+                continue
+            break
+        if resp.status_code >= 300:
+            msg = resp.text[:300]
+            log.error("Alpaca bars %s failed: %s %s", symbol, resp.status_code, msg)
+            raise RuntimeError(f"Alpaca bars HTTP {resp.status_code}: {msg}")
+        body = resp.json() or {}
+        bars.extend(body.get("bars") or [])
+        token = body.get("next_page_token")
+        if not token:
+            return bars
+        params["page_token"] = token
+    raise RuntimeError(f"Alpaca bars for {symbol}: more than 20 pages -- aborting")

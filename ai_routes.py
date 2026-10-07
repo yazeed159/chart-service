@@ -94,7 +94,8 @@ def support_resistance():
     if request.method == "OPTIONS":
         return "", 204
 
-    from chart_service import _build_daily_chart_response, SR_LOOKBACK_DAYS_DEFAULT
+    from charts import _build_daily_chart_response
+    from config import SR_LOOKBACK_DAYS_DEFAULT
 
     start = time.monotonic()
     body = request.get_json(force=True, silent=True) or {}

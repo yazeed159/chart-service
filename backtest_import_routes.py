@@ -100,7 +100,7 @@ def _run_backtest_import(run: dict, trades: list):
     then POSTs the whole enriched batch back to run['callback_url']."""
     # Lazy import so it doesn't matter whether chart_service.py or this
     # module gets imported first (same reasoning as ai_routes.py).
-    from chart_service import _build_chart_response
+    from charts import _build_chart_response
 
     job_id = run.get("job_id")
     callback_url = run.get("callback_url")

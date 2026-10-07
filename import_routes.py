@@ -28,7 +28,8 @@ paced CHART_PACING_SECONDS apart (shared Polygon rate limit), so a
 larger import can take several minutes. The background thread writes
 {status, total, completed, current} to the job file after every trade so
 GET /import-trades/<job_id> can show real progress instead of a bare
-spinner, and POST /import-trades/<job_id>/cancel sets an in-memory
+spinner, and POST /import-trades   (optional form field overwrite=1 re-does trades already in the journal;
+                       otherwise those are skipped and listed in "already_imported")/<job_id>/cancel sets an in-memory
 threading.Event the loop checks before starting each new trade -- it
 won't abort a chart/Gemini call already in flight, but it stops picking
 up further trades and immediately publishes whatever was already
@@ -52,8 +53,12 @@ POST /import-trades
   -> 400 / 401 / 422 -- see below
 
 GET /import-trades/<job_id>
-  -> 200 { "status": "processing", "total": <int>, "completed": <int>,
-           "current": {"symbol", "trade_date"} | null }
+  -> 200 { "status": "processing", "phase": "charting" | "publishing",
+           "total": <int>, "completed": <int>,
+           "current": {"symbol", "trade_date"} | null,
+           "trade_states": [{"id", "symbol", "trade_date", "state", "note"}] }
+           (state: queued | charting | charted | chart_failed | publishing |
+            saved | published | skipped | failed -- updated live)
   -> 200 { "status": "done" | "cancelled", "total", "completed",
            "trades": [...enriched], "publish_results": [...] }
   -> 404 unknown job_id
@@ -101,12 +106,49 @@ def _write_job(job_id: str, data: dict):
     _job_path(job_id).write_text(json.dumps(data, indent=2, default=str))
 
 
-def _run_import_job(job_id: str, trades: list[dict], cancel_event: threading.Event):
-    """Background thread: chart -> verdict -> final chart, one trade at a
-    time (checking cancel_event before each), then publish whatever got
-    enriched. Never raises -- process_trade already degrades gracefully
-    per-trade, and publish_trades marks anything it can't publish as
-    'failed'/'skipped' rather than throwing."""
+def _trade_id(t: dict) -> str:
+    """Same id formula publish.prepare_trade_payload uses, so the browser can
+    match live per-trade states to its table rows."""
+    d = (t.get("Trade Date") or "").replace("-", "")
+    e = (t.get("Entry Time") or "").replace(":", "")
+    return f"{t.get('Symbol')}-{d}-{e}"
+
+
+def _existing_trade_ids(user_id, ids: list[str]) -> set[str] | None:
+    """Which of these trade ids are already fully imported -- i.e. have a
+    trade_details row (the trades index row is written first, so a trade
+    whose detail step failed has an index row but no detail, and gets
+    retried). Returns None if the lookup failed
+    (caller then just processes everything -- safe, since saving is an
+    upsert)."""
+    import requests
+    from publish import SUPABASE_URL, _supabase_headers
+    found: set[str] = set()
+    uniq = list(dict.fromkeys(ids))
+    try:
+        for i in range(0, len(uniq), 80):
+            chunk = uniq[i:i + 80]
+            quoted = ",".join('"' + c.replace('"', "") + '"' for c in chunk)
+            resp = requests.get(
+                f"{SUPABASE_URL}/rest/v1/trade_details",
+                params={"user_id": f"eq.{user_id}", "trade_id": f"in.({quoted})", "select": "trade_id"},
+                headers=_supabase_headers(), timeout=20,
+            )
+            resp.raise_for_status()
+            found.update(r["trade_id"] for r in resp.json())
+        return found
+    except Exception as e:
+        log.warning("existing-trade lookup failed (will process all): %s", e)
+        return None
+
+
+def _run_import_job(job_id: str, trades: list[dict], cancel_event: threading.Event, skip_ids: set | None = None):
+    """Background thread: for each trade in turn (checking cancel_event
+    before each) chart -> verdict -> final chart, then publish THAT trade
+    immediately, so one failure never takes the others down and everything
+    that succeeds is already saved. Never raises -- process_trade degrades
+    gracefully per-trade, and publish_trades marks anything it can't publish
+    as 'failed'/'skipped' rather than throwing."""
     from daily_sync import process_trade  # lazy import, same pattern as everywhere else in this service
     from publish import publish_trades
 
@@ -114,38 +156,99 @@ def _run_import_job(job_id: str, trades: list[dict], cancel_event: threading.Eve
     enriched = []
     cancelled = False
 
+    # Live per-trade state, written into the job file after every change so
+    # GET /import-trades/<job_id> can show each trade's status while it runs.
+    # state: queued | charting | charted | chart_failed | publishing | saved |
+    #        published | skipped | failed
+    states = {}
+    order = []
+    for t in trades:
+        tid = _trade_id(t)
+        order.append(tid)
+        states[tid] = {"id": tid, "symbol": t.get("Symbol"), "trade_date": t.get("Trade Date"), "state": "queued", "note": ""}
+
+    def _flush(phase, completed, current=None, status="processing"):
+        _write_job(job_id, {
+            "status": status, "phase": phase, "total": total, "completed": completed,
+            "current": current, "trade_states": [states[i] for i in order],
+        })
+
+    def _set(tid, state, note=""):
+        if tid in states:
+            states[tid]["state"] = state
+            states[tid]["note"] = note
+
+    publish_results = []
+    done_count = 0
+    skip_ids = skip_ids or set()
+    did_work = False  # pace only after a trade that actually hit the data/AI APIs
+
     for i, trade in enumerate(trades):
         if cancel_event.is_set():
             cancelled = True
             log.info("import job %s: cancelled after %d/%d trades", job_id, i, total)
             break
-        if i > 0:
-            time.sleep(CHART_PACING_SECONDS)
 
-        _write_job(job_id, {
-            "status": "processing", "total": total, "completed": i,
-            "current": {"symbol": trade.get("Symbol"), "trade_date": trade.get("Trade Date")},
-        })
+        tid = _trade_id(trade)
+        if tid in skip_ids:
+            reason = "already in your journal -- skipped (tick 'overwrite' to redo it)"
+            _set(tid, "skipped", reason)
+            publish_results.append({"status": "skipped", "id": tid, "reason": reason})
+            enriched.append(trade)
+            done_count += 1
+            _flush("charting", done_count, None)
+            continue
+
+        if did_work:
+            time.sleep(CHART_PACING_SECONDS)
+        did_work = True
+        cur = {"symbol": trade.get("Symbol"), "trade_date": trade.get("Trade Date")}
+        _set(tid, "charting", "building chart + AI verdict")
+        _flush("charting", done_count, cur)
         try:
-            enriched.append(process_trade(trade))
+            result = process_trade(trade)
+            if result.get("_final_bars") and result.get("_final_indicators"):
+                _set(tid, "charted", "chart + verdict ready, publishing")
+            else:
+                _set(tid, "chart_failed", (result.get("_chart_error") or "no chart data returned (price bars unavailable)") + " -- will be skipped")
         except Exception as e:
             log.error("import job %s: process_trade crashed for %s %s: %s", job_id, trade.get("Symbol"), trade.get("Trade Date"), e)
             trade["_final_indicators"] = None
             trade["_final_bars"] = None
             trade["_final_image_base64"] = None
-            enriched.append(trade)
+            trade["_chart_error"] = f"chart/verdict crashed: {type(e).__name__}: {e}"[:250]
+            result = trade
+            _set(tid, "chart_failed", result["_chart_error"])
+        enriched.append(result)
 
-    publish_results = []
-    if enriched:
+        # Publish THIS trade right away (detail row + index row) so one bad
+        # trade can't sink the rest, and everything that works is saved as we go.
+        _flush("publishing", done_count, cur)
+
+        def _on_event(trade_id, state, reason="", _cur=cur, _n=done_count):
+            _set(trade_id, state, reason)
+            _flush("publishing", _n, _cur)
+
         try:
-            publish_results = publish_trades(enriched)
+            publish_results.extend(publish_trades([result], on_event=_on_event))
         except Exception as e:
-            log.error("import job %s: publish step failed entirely: %s", job_id, e)
+            log.error("import job %s: publish crashed for %s: %s", job_id, tid, e)
+            reason = f"publish crashed: {type(e).__name__}: {e}"[:250]
+            _set(tid, "failed", reason)
+            publish_results.append({"status": "failed", "id": tid, "reason": reason})
+        done_count += 1
+        _flush("charting", done_count, None)
+
+    # Trades never reached because of a cancel
+    if cancelled:
+        for t in trades[len(enriched):]:
+            _set(_trade_id(t), "skipped", "cancelled before this trade ran")
 
     _write_job(job_id, {
-        "status": "cancelled" if cancelled else "done",
+        "status": "cancelled" if cancelled else "done", "phase": "finished",
         "total": total, "completed": len(enriched),
         "trades": enriched, "publish_results": publish_results,
+        "trade_states": [states[i] for i in order],
     })
     _cancel_events.pop(job_id, None)
     log.info("import job %s: %s, %d/%d trades processed", job_id, "cancelled" if cancelled else "done", len(enriched), total)
@@ -188,27 +291,43 @@ def import_trades():
         }), 422
 
     raw_executions = parse_csv_executions(valid_rows)
+    ignored: list = []
     try:
         from publish import resolve_account_id  # lazy import, same pattern as elsewhere in this service
         target_account = resolve_account_id(user_id, (request.form.get("account_id") or "").strip() or None)
-        closed_trades = fifo_match_and_merge(raw_executions, account={"user_id": user_id, "account_id": target_account})
+        closed_trades = fifo_match_and_merge(raw_executions, account={"user_id": user_id, "account_id": target_account}, skipped=ignored)
     except Exception as e:
         log.error("import-trades: FIFO matching failed: %s", e)
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
     log.info(
-        "import-trades: user %s: %d rows -> %d closed trades (%d skipped)",
-        user_id, len(rows), len(closed_trades), skipped,
+        "import-trades: user %s: %d rows -> %d closed trades (%d skipped, %d incomplete positions ignored)",
+        user_id, len(rows), len(closed_trades), skipped, len(ignored),
     )
+    for ig in ignored:
+        log.info("import-trades: ignored %s %s: %s", ig.get("symbol"), ig.get("date"), ig.get("reason"))
+
+    overwrite = (request.form.get("overwrite") or "").strip().lower() in ("1", "true", "on", "yes")
+    skip_ids: set = set()
+    lookup_failed = False
+    if not overwrite:
+        existing = _existing_trade_ids(user_id, [_trade_id(t) for t in closed_trades])
+        if existing is None:
+            lookup_failed = True
+        else:
+            skip_ids = existing
+    log.info("import-trades: %d of %d trades already in journal (overwrite=%s)", len(skip_ids), len(closed_trades), overwrite)
 
     job_id = uuid.uuid4().hex
     cancel_event = threading.Event()
     _cancel_events[job_id] = cancel_event
     _write_job(job_id, {"status": "processing", "total": len(closed_trades), "completed": 0, "current": None})
-    th = threading.Thread(target=_run_import_job, args=(job_id, closed_trades, cancel_event), daemon=True)
+    th = threading.Thread(target=_run_import_job, args=(job_id, closed_trades, cancel_event, skip_ids), daemon=True)
     th.start()
 
-    return jsonify({"job_id": job_id, "trades": closed_trades, "skipped_rows": skipped}), 202
+    return jsonify({"job_id": job_id, "trades": closed_trades, "skipped_rows": skipped,
+                    "ignored_incomplete": ignored,
+                    "already_imported": sorted(skip_ids), "existing_check_failed": lookup_failed}), 202
 
 
 @bp.route("/import-trades/<job_id>", methods=["GET"])

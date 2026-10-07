@@ -625,13 +625,14 @@ def process_trade(trade: dict) -> dict:
     Chart". Never raises -- a failure at any step degrades gracefully
     (null indicators/bars/image) same as the n8n graph's onError:
     continueRegularOutput on both chart calls."""
-    from chart_service import _build_chart_response
+    from charts import _build_chart_response
 
     symbol = trade.get("Symbol")
     trade_date = trade.get("Trade Date")
     side = (trade.get("Side") or "Long").lower()
 
     chart = None
+    chart_err = None
     try:
         chart = _build_chart_response({
             "symbol": symbol, "trade_date": trade_date,
@@ -640,6 +641,7 @@ def process_trade(trade: dict) -> dict:
             "side": side, "include_volume_stats": True,
         }, time.monotonic())
     except Exception as e:
+        chart_err = f"{type(e).__name__}: {e}"[:250]
         log.error("Generate Chart failed for %s %s: %s", symbol, trade_date, e)
 
     summary = _indicator_summary(chart)
@@ -654,6 +656,7 @@ def process_trade(trade: dict) -> dict:
     trade = _apply_verdict(trade, verdict)
 
     final_chart = None
+    final_err = None
     try:
         final_chart = _build_chart_response({
             "symbol": symbol, "trade_date": trade_date,
@@ -669,7 +672,12 @@ def process_trade(trade: dict) -> dict:
             "include_volume_stats": False,
         }, time.monotonic())
     except Exception as e:
+        final_err = f"{type(e).__name__}: {e}"[:250]
         log.error("Generate Final Chart failed for %s %s: %s", symbol, trade_date, e)
+
+    # Surface WHY a chart is missing (shown on the import page + in publish
+    # results) instead of the trade silently turning into a bare "skipped".
+    trade["_chart_error"] = None if final_chart else (final_err or chart_err)
 
     trade["_final_indicators"] = final_chart["indicators"] if final_chart else None
     trade["_final_bars"] = final_chart["bars"] if final_chart else None
@@ -688,9 +696,12 @@ def process_account(account: dict) -> list[dict]:
     is needed here)."""
     flex_doc = request_flex_statement(account)
     raw_executions = parse_flex_executions(flex_doc)
-    closed_trades = fifo_match_and_merge(raw_executions, account=account)
+    ignored: list = []
+    closed_trades = fifo_match_and_merge(raw_executions, account=account, skipped=ignored)
 
     log.info("account %s: %d executions -> %d closed trades", account.get("id"), len(raw_executions), len(closed_trades))
+    for ig in ignored:
+        log.info("account %s: ignored %s %s: %s", account.get("id"), ig.get("symbol"), ig.get("date"), ig.get("reason"))
 
     enriched = []
     for i, trade in enumerate(closed_trades):

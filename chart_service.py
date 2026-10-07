@@ -211,6 +211,16 @@ Env vars:
 """
 
 import os
+import sys
+
+# `python chart_service.py` runs this file as module "__main__". Any later
+# `from chart_service import ...` would then load a SECOND copy of it and
+# re-run the register_blueprint() calls below on the already-serving app,
+# which Flask rejects ("setup method 'register_blueprint' can no longer be
+# called ... already handled its first request"). Point the name at the
+# running module so a re-import is a no-op.
+if __name__ == "__main__":
+    sys.modules.setdefault("chart_service", sys.modules["__main__"])
 
 from config import app
 

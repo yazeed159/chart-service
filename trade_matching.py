@@ -10,6 +10,12 @@ otherwise throw away (e.g. one entry sold in two pieces at different
 exit prices/times): "Fill Count" > 1 means Entry/Exit Price is a
 quantity-weighted average, and "Fills" has the individual pieces.
 
+A trade here is a whole POSITION, flat -> flat: if you scale in (add to a
+position) and/or scale out (sell in pieces) before getting back to zero, all
+of it is ONE trade. "Entry Price"/"Exit Price" are quantity-weighted averages,
+"Entry Time" is the first entry, "Exit Time" the last exit, and "Fills" holds
+every matched piece so the UI can mark each individual add/reduce on the chart.
+
 Shared between:
   - /import-trades (CSV import -- this round)
   - the daily IBKR Flex sync pipeline (next round)
@@ -42,6 +48,12 @@ CSV_ALIASES = {
     "tradePrice": ["tradeprice", "price", "fillprice", "executionprice"],
     "buySell": ["buysell", "side", "action", "direction"],
     "commission": ["ibcommission", "commission", "fees", "comm"],
+    # Broker-supplied "is this fill opening or closing a position" flag (IBKR:
+    # Open/CloseIndicator = O / C / C;O). Optional -- a hand-made CSV won't have it.
+    "openClose": ["opencloseindicator", "openclose"],
+    # Broker's unique per-fill id, used (when present) to de-dupe precisely.
+    "execId": ["ibexecid", "execid", "executionid", "tradeid"],
+    "levelOfDetail": ["levelofdetail"],
 }
 
 
@@ -97,15 +109,53 @@ def format_date(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d")
 
 
+
+def _is_close_only(indicator: Any) -> bool:
+    """True when the broker flagged this fill as CLOSING a position only
+    (IBKR Open/CloseIndicator "C"). "C;O" (closes one position and opens the
+    opposite one in the same fill) is NOT close-only, and a missing/blank
+    indicator is never close-only -- so files without the column behave as
+    before."""
+    tokens = {t for t in re.split(r"[;,/\s]+", str(indicator or "").upper()) if t}
+    closing = bool(tokens & {"C", "CLOSE", "CLOSED"})
+    opening = bool(tokens & {"O", "OPEN"})
+    return closing and not opening
+
+
+def keep_execution_level(items: list, level_of) -> list:
+    """IBKR exports can carry the SAME fills at several levels of detail in one
+    file: an ORDER row (one aggregate per order) plus the individual EXECUTION
+    rows that make it up (and sometimes SUMMARY / CLOSED_LOT rows). Counting
+    more than one level double-counts every fill, which invents phantom
+    shares and phantom shorts. So: if any EXECUTION rows exist keep only those;
+    otherwise if any ORDER rows exist keep only those; otherwise (no level
+    column at all, e.g. a hand-made CSV) keep everything untouched."""
+    levels = {str(level_of(i) or "").strip().upper() for i in items}
+    if "EXECUTION" in levels:
+        want = "EXECUTION"
+    elif "ORDER" in levels:
+        want = "ORDER"
+    else:
+        return items
+    return [i for i in items if str(level_of(i) or "").strip().upper() == want]
+
+
+def _is_repeated_header_row(row: dict) -> bool:
+    """Some broker exports paste a second header line mid-file (the section
+    changes). Its 'symbol' cell literally says 'Symbol' -- never a trade."""
+    sym = str(_find_csv_field(row, CSV_ALIASES["symbol"]) or "").strip().lower()
+    return sym in ("symbol", "ticker")
+
+
 def parse_csv_executions(rows: list[dict]) -> list[dict]:
     """Raw broker-agnostic executions from CSV rows with any reasonable
     header spelling (see CSV_ALIASES). Skips stray/blank/summary rows and
     de-dupes on (symbol, dateTime, buySell, qty, price, commission)."""
     seen: set[str] = set()
     raw_trades: list[dict] = []
+    rows = [r for r in rows if isinstance(r, dict) and looks_like_csv_row(r) and not _is_repeated_header_row(r)]
+    rows = keep_execution_level(rows, lambda r: _find_csv_field(r, CSV_ALIASES["levelOfDetail"]))
     for row in rows:
-        if not looks_like_csv_row(row):
-            continue
         symbol = _find_csv_field(row, CSV_ALIASES["symbol"])
         date_time = _find_csv_field(row, CSV_ALIASES["dateTime"])
         quantity = _find_csv_field(row, CSV_ALIASES["quantity"])
@@ -123,7 +173,10 @@ def parse_csv_executions(rows: list[dict]) -> list[dict]:
         if buy_sell and re.search(r"sell|short|s", str(buy_sell).strip(), re.I) and qty > 0:
             qty = -qty
 
-        key = "|".join(str(x) for x in (symbol, date_time, buy_sell, qty, trade_price, commission))
+        open_close = _find_csv_field(row, CSV_ALIASES["openClose"])
+        exec_id = _find_csv_field(row, CSV_ALIASES["execId"])
+        key = ("id|" + str(exec_id)) if exec_id else "|".join(
+            str(x) for x in (symbol, date_time, buy_sell, qty, trade_price, commission))
         if key in seen:
             continue
         seen.add(key)
@@ -133,6 +186,7 @@ def parse_csv_executions(rows: list[dict]) -> list[dict]:
             "quantity": qty,
             "tradePrice": trade_price,
             "commission": commission,
+            "openClose": open_close,
             "_source": "csv",
         })
     return raw_trades
@@ -142,7 +196,8 @@ def _sign(x: float) -> int:
     return (x > 0) - (x < 0)
 
 
-def fifo_match_and_merge(raw_trades: list[dict], account: Optional[dict] = None) -> list[dict]:
+def fifo_match_and_merge(raw_trades: list[dict], account: Optional[dict] = None,
+                         skipped: Optional[list] = None) -> list[dict]:
     """Shared FIFO-matching + same-order-fill-merging logic for both the
     CSV import path and the (future) daily Flex path.
 
@@ -153,6 +208,18 @@ def fifo_match_and_merge(raw_trades: list[dict], account: Optional[dict] = None)
     account: optional {user_id, id} for the multi-tenant daily path --
     None for CSV imports, matching the original node's try/catch-to-null
     behavior when it's fed by anything other than 'Loop Broker Accounts'.
+
+    skipped: optional list; when given, every piece of data that was IGNORED
+    because the file doesn't hold the whole position gets appended to it
+    (see "orphan closes" below) so callers can tell the user what was dropped.
+
+    Orphan closes: a fill the broker flags as closing-only (Open/CloseIndicator
+    "C") that has nothing to close in THIS file -- the position was opened in an
+    earlier file/day -- is ignored. It is never turned into a fresh short/long,
+    and it never gets merged into some other trade. If a closing fill only
+    partly matches (some of its shares have no opening fill here), the whole
+    position is incomplete, so that trade is dropped too rather than reported
+    with a wrong average entry.
     """
     executions = []
     for e in raw_trades:
@@ -172,6 +239,7 @@ def fifo_match_and_merge(raw_trades: list[dict], account: Optional[dict] = None)
             "price": price,
             "commission": abs(float(e.get("commission") or 0)),
             "source": e.get("_source"),
+            "close_only": _is_close_only(e.get("openClose")),
         })
     executions.sort(key=lambda ex: ex["dateTime"])
 
@@ -183,19 +251,31 @@ def fifo_match_and_merge(raw_trades: list[dict], account: Optional[dict] = None)
     # produce several of these when the broker fills an order in more than
     # one piece -- merged back together below.
     raw_matches = []
+    incomplete_cycles: dict[tuple, list[dict]] = {}   # (sym, cycle) -> orphaned closing pieces
+    orphan_only: dict[str, list[dict]] = {}           # sym -> closing fills with nothing to close
     for sym, execs in by_symbol.items():
         queue: list[dict] = []
+        # A "position cycle" runs from flat -> flat (open, add to it, trim
+        # it, ... until it is fully closed). Every match produced inside one
+        # cycle belongs to the SAME trade, however many entries/exits it
+        # took. Flipping long->short in one execution closes one cycle and
+        # opens the next.
+        cycle = 0
         for ex in execs:
             remaining = ex["qty"]
+            matched_any = False
             while remaining != 0 and queue and _sign(queue[0]["qty"]) != _sign(remaining):
                 lot = queue[0]
                 match_qty = min(abs(lot["qty"]), abs(remaining))
                 direction = 1 if lot["qty"] > 0 else -1
                 pnl_before_comm = direction * match_qty * (ex["price"] - lot["price"])
-                commission = (
-                    lot["commission"] * (match_qty / abs(lot["qty"]))
-                    + ex["commission"] * (match_qty / abs(ex["qty"]))
-                )
+                # Take this match's share of what is LEFT of the lot's commission
+                # (and shrink it), since lot["qty"] shrinks as the lot is consumed.
+                # Dividing the lot's ORIGINAL commission by its REMAINING qty
+                # charged the same commission again on every partial match.
+                lot_comm_share = lot["commission"] * (match_qty / abs(lot["qty"]))
+                lot["commission"] -= lot_comm_share
+                commission = lot_comm_share + ex["commission"] * (match_qty / abs(ex["qty"]))
                 raw_matches.append({
                     "symbol": sym,
                     "entryDateTime": lot["dateTime"],
@@ -207,16 +287,34 @@ def fifo_match_and_merge(raw_trades: list[dict], account: Optional[dict] = None)
                     "pnlBeforeComm": pnl_before_comm,
                     "commission": commission,
                     "source": ex["source"],
+                    "cycle": (sym, cycle),
                 })
+                matched_any = True
                 lot["qty"] -= direction * match_qty
                 remaining += direction * match_qty
                 if lot["qty"] == 0:
                     queue.pop(0)
-            if remaining != 0:
+            if remaining != 0 and ex["close_only"]:
+                # Closing-only fill with (some) shares that have no opening fill
+                # in this file -> ignore those shares, never open a position.
+                orphan_qty = abs(remaining)
+                if matched_any:
+                    incomplete_cycles.setdefault((sym, cycle), []).append({
+                        "symbol": sym, "time": ex["dateTime"], "qty": orphan_qty, "price": ex["price"]})
+                    if not queue:
+                        cycle += 1
+                else:
+                    orphan_only.setdefault(sym, []).append({
+                        "symbol": sym, "time": ex["dateTime"], "qty": orphan_qty, "price": ex["price"]})
+            elif remaining != 0:
+                if matched_any and not queue:
+                    cycle += 1  # flipped through flat: remainder opens a new position
                 queue.append({
                     "qty": remaining, "price": ex["price"], "dateTime": ex["dateTime"],
                     "commission": ex["commission"], "source": ex["source"],
                 })
+            elif matched_any and not queue:
+                cycle += 1  # exactly flat: next execution starts a new position
 
     # Merge matches that belong to the same trade (same symbol + entry
     # date + entry time) -- two raw matches sharing that key are fills of
@@ -224,12 +322,33 @@ def fifo_match_and_merge(raw_trades: list[dict], account: Optional[dict] = None)
     # downstream, or they'd collide on the same trade id.
     groups: dict[tuple, list[dict]] = {}
     for m in raw_matches:
-        key = (m["symbol"], format_date(m["entryDateTime"]), format_time(m["entryDateTime"]))
-        groups.setdefault(key, []).append(m)
+        groups.setdefault(m["cycle"], []).append(m)
+
+    if skipped is not None:
+        for sym, pieces in orphan_only.items():
+            skipped.append({
+                "symbol": sym, "reason": "closing fills with no opening fill in this file (position opened earlier) -- ignored",
+                "fills": len(pieces), "qty": sum(p["qty"] for p in pieces),
+                "first_time": format_time(min(p["time"] for p in pieces)),
+                "date": format_date(min(p["time"] for p in pieces)),
+            })
+        for (sym, _c), pieces in incomplete_cycles.items():
+            ms = groups.get((sym, _c)) or []
+            if not ms:
+                continue
+            skipped.append({
+                "symbol": sym, "reason": "position only partly opened in this file (closing fills exceed opening fills) -- whole trade ignored",
+                "fills": len(ms), "qty": sum(m["matchQty"] for m in ms) + sum(p["qty"] for p in pieces),
+                "first_time": format_time(min(m["entryDateTime"] for m in ms)),
+                "date": format_date(min(m["entryDateTime"] for m in ms)),
+            })
 
     closed_trades = []
-    for matches in groups.values():
-        first = matches[0]
+    for key, matches in groups.items():
+        if key in incomplete_cycles:
+            continue
+        # First entry of the position (not just first match in list order).
+        first = min(matches, key=lambda m: m["entryDateTime"])
         total_qty = sum(m["matchQty"] for m in matches)
         entry_price_avg = sum(m["entryPrice"] * m["matchQty"] for m in matches) / total_qty
         exit_price_avg = sum(m["exitPrice"] * m["matchQty"] for m in matches) / total_qty
@@ -245,7 +364,7 @@ def fifo_match_and_merge(raw_trades: list[dict], account: Optional[dict] = None)
         # The individual raw FIFO matches merged into this trade -- this is
         # exactly what Entry/Exit Price above average away. Sorted by exit
         # time so a scaled-out trade's fills read in the order they filled.
-        fills_sorted = sorted(matches, key=lambda m: m["exitDateTime"])
+        fills_sorted = sorted(matches, key=lambda m: (m["exitDateTime"], m["entryDateTime"]))
         fills = [{
             "entry_time": format_time(m["entryDateTime"]),
             "entry_price": round(m["entryPrice"], 4),
@@ -325,7 +444,8 @@ def parse_flex_executions(flex_doc: dict) -> list[dict]:
     statements = as_list_helper(flex_response["FlexStatements"].get("FlexStatement"))
     for stmt in statements:
         trade_confirms = (stmt or {}).get("TradeConfirms") or {}
-        confirms = as_list_helper(trade_confirms.get("TradeConfirm"))
+        confirms = [t for t in as_list_helper(trade_confirms.get("TradeConfirm")) if t]
+        confirms = keep_execution_level(confirms, lambda t: t.get("levelOfDetail"))
         for trade in confirms:
             if not trade:
                 continue
@@ -340,6 +460,7 @@ def parse_flex_executions(flex_doc: dict) -> list[dict]:
                 "quantity": trade.get("quantity"),
                 "tradePrice": trade.get("price"),
                 "commission": trade.get("commission") or 0,
+                "openClose": trade.get("openCloseIndicator"),
                 "_source": "daily",
             })
     return raw_trades

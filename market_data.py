@@ -6,14 +6,17 @@ Split out of the old chart_service.py -- see chart_service.py's module
 docstring for how these files fit together.
 """
 
+import os
 import time
 import threading
+from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta, date
 
 import requests
 import pandas as pd
 
 import float_shares_store
+import alpaca_client
 from config import (
     log, POLYGON_API_KEY, WINDOW_BEFORE, WINDOW_AFTER, LOOKBACK_DAYS,
     ENABLE_VOLUME_FLOAT_STATS, VOLUME_STATS_LOOKBACK_DAYS, SR_LOOKBACK_DAYS_DEFAULT,
@@ -103,6 +106,73 @@ _bars_cache = {}
 
 _bars_cache_lock = threading.Lock()
 
+def _fetch_raw_bars_from_alpaca(symbol: str, trade_date_obj: date) -> pd.DataFrame:
+    """Same shape as _fetch_raw_bars_from_polygon (ET-indexed Open/High/Low/
+    Close/Volume/vwap_bar, gap-filled), sourced from Alpaca's historical
+    minute bars. The free plan's full-market SIP feed is allowed for data
+    >= 15 minutes old, so the window's end is clamped to now - 16 min."""
+    start_et = datetime.combine(trade_date_obj - timedelta(days=_minute_bar_lookback_days()), datetime.min.time(), tzinfo=ET)
+    end_et = datetime.combine(trade_date_obj, datetime.max.time().replace(microsecond=0), tzinfo=ET)
+    cutoff = datetime.now(ET) - timedelta(minutes=16)
+    if end_et > cutoff:
+        end_et = cutoff
+    if end_et <= start_et:
+        raise ValueError(f"Alpaca: {trade_date_obj} is too recent to query yet (free plan needs data >= 15 min old)")
+    raw = alpaca_client.get_minute_bars(symbol, start_et.astimezone(ZoneInfo("UTC")), end_et.astimezone(ZoneInfo("UTC")))
+    if not raw:
+        raise ValueError(f"Alpaca returned no minute bars for {symbol} between {start_et:%Y-%m-%d} and {end_et:%Y-%m-%d}")
+    df = pd.DataFrame(raw)
+    df["t"] = pd.to_datetime(df["t"], utc=True).dt.tz_convert(ET)
+    df = df.rename(columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume", "vw": "vwap_bar"})
+    if "vwap_bar" not in df.columns:
+        df["vwap_bar"] = df["Close"]
+    df = df.set_index("t")[["Open", "High", "Low", "Close", "Volume", "vwap_bar"]].sort_index()
+    return _fill_intraday_gaps(df)
+
+
+def _has_trade_day(df: pd.DataFrame, trade_date_obj: date) -> bool:
+    return df is not None and not df.empty and bool((df.index.date == trade_date_obj).any())
+
+
+def _fetch_raw_bars(symbol: str, trade_date_obj: date) -> pd.DataFrame:
+    """Minute bars from the configured provider, falling back to the other
+    one when the first errors or has nothing on the trade date.
+    BARS_PROVIDER env: "auto" (default -- Alpaca first when its keys are set,
+    else Polygon), "alpaca", or "polygon". The Polygon free plan often lags a
+    day or more on minute data; Alpaca's free plan serves full-market history
+    older than 15 minutes."""
+    mode = (os.environ.get("BARS_PROVIDER") or "auto").lower()
+    if mode == "polygon":
+        order = ["polygon"]
+    elif mode == "alpaca":
+        order = ["alpaca"]
+    else:
+        order = ["alpaca", "polygon"] if alpaca_client.available() else ["polygon"]
+
+    errors = []
+    last_df = None
+    for provider in order:
+        try:
+            df = _fetch_raw_bars_from_alpaca(symbol, trade_date_obj) if provider == "alpaca" else _fetch_raw_bars_from_polygon(symbol, trade_date_obj)
+        except Exception as e:
+            errors.append(f"{provider}: {type(e).__name__}: {e}")
+            log.warning("bars from %s failed for %s %s: %s", provider, symbol, trade_date_obj, e)
+            continue
+        if _has_trade_day(df, trade_date_obj):
+            if errors:
+                log.info("bars for %s %s came from %s after: %s", symbol, trade_date_obj, provider, " | ".join(errors))
+            return df
+        errors.append(f"{provider}: has {len(df)} bars for {symbol} but none on {trade_date_obj} (latest {df.index.max():%Y-%m-%d %H:%M} ET)")
+        log.warning("%s", errors[-1])
+        last_df = df
+    # Nothing had the trade day. If a provider returned older bars, hand those
+    # back so fetch_bars() raises its detailed "no bars in window" message;
+    # otherwise raise everything we learned.
+    if last_df is not None:
+        return last_df
+    raise ValueError("No minute bars available -- " + " || ".join(errors))
+
+
 def _get_cached_raw_bars(symbol: str, trade_date_obj: date) -> pd.DataFrame:
     """Shared entry point for anything that needs a symbol's raw minute bars
     for one trading day -- fetch_bars() (below, backs /generate-chart) AND
@@ -120,7 +190,7 @@ def _get_cached_raw_bars(symbol: str, trade_date_obj: date) -> pd.DataFrame:
         log.info("Bars cache hit for %s %s -- skipping Polygon call", symbol, trade_date_obj)
         return cached
 
-    df = _fetch_raw_bars_from_polygon(symbol, trade_date_obj)
+    df = _fetch_raw_bars(symbol, trade_date_obj)
     with _bars_cache_lock:
         if len(_bars_cache) >= _BARS_CACHE_MAX:
             _bars_cache.pop(next(iter(_bars_cache)))  # evict oldest (dict insertion order)
@@ -141,7 +211,19 @@ def fetch_bars(symbol: str, trade_date: str, entry_dt: datetime, exit_dt: dateti
     display_mask = (df.index >= window_start) & (df.index <= window_end)
 
     if not display_mask.any():
-        raise ValueError(f"No bars in display window {window_start}–{window_end} for {symbol} (thin small-cap volume can leave gaps — try widening CHART_WINDOW_BEFORE_MIN)")
+        # Say WHAT Polygon actually gave us, so "no data for that day at all"
+        # (plan/delay/key problem) is distinguishable from "data exists but
+        # not at these times" (wrong timezone or a thin ticker).
+        day_df = df[df.index.date == trade_date_obj]
+        if day_df.empty:
+            detail = (f"the data provider returned {len(df)} bars for {symbol} but NONE on {trade_date} "
+                      f"(latest bar it has: {df.index.max():%Y-%m-%d %H:%M} ET) -- the data for that day "
+                      f"isn't available to this API key/plan yet")
+        else:
+            detail = (f"the data provider has {len(day_df)} bars for {symbol} on {trade_date}, from "
+                      f"{day_df.index.min():%H:%M} to {day_df.index.max():%H:%M} ET, but none inside the "
+                      f"{window_start:%H:%M}-{window_end:%H:%M} window -- check the CSV times are US/Eastern")
+        raise ValueError(f"No bars in display window for {symbol}: {detail}")
 
     return df, display_mask
 

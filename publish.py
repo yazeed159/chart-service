@@ -58,6 +58,16 @@ SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 DETAIL_PUBLISH_PACING_S = 0.75
 
 
+def _as_int(v):
+    """Supabase int columns reject '167.0'; coerce whole-number floats."""
+    if v is None or v == "":
+        return None
+    try:
+        return int(round(float(v)))
+    except (TypeError, ValueError):
+        return None
+
+
 def _supabase_headers() -> dict:
     return {
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
@@ -132,10 +142,10 @@ def prepare_trade_payload(trade: dict) -> dict:
         "entry_price": float(trade["Entry Price"]) if trade.get("Entry Price") is not None else None,
         "exit_price": float(trade["Exit Price"]) if trade.get("Exit Price") is not None else None,
         "entry_indicator": trade.get("Entry Indicator") or "", "exit_indicator": trade.get("Exit Indicator") or "",
-        "shares": trade.get("No. of Shares"), "time_in_trade": trade.get("Time in Trade"),
+        "shares": _as_int(trade.get("No. of Shares")), "time_in_trade": trade.get("Time in Trade"),
         "pnl_before_comm": trade.get("P&L Before Comm"), "commission": trade.get("Commission"),
         "pnl_after_comm": trade.get("P&L After Comm"), "win": trade.get("Result") == "Win",
-        "fill_count": trade.get("Fill Count") or 1, "fills": trade.get("Fills") or [],
+        "fill_count": _as_int(trade.get("Fill Count")) or 1, "fills": trade.get("Fills") or [],
         "verdict": trade.get("LLM Reasoning") or "", "setup_type": trade.get("Setup Type") or "",
         "better_entry": better_entry, "better_exit": better_exit,
         "suggested_stop": trade.get("Suggested Stop"), "suggested_target": trade.get("Suggested Target"),
@@ -207,9 +217,11 @@ def _publish_trade_detail(payload: dict) -> bool:
         )
     except requests.RequestException as e:
         log.error("trade_details publish failed for %s: %s", payload["id"], e)
+        payload["_error"] = f"trade_details request failed: {type(e).__name__}: {e}"[:300]
         return False
     if resp.status_code not in (200, 201):
         log.error("trade_details publish failed for %s: HTTP %s %s", payload["id"], resp.status_code, resp.text[:500])
+        payload["_error"] = f"trade_details HTTP {resp.status_code}: {resp.text[:250]}"
         return False
     return True
 
@@ -267,7 +279,7 @@ def resolve_account_id(user_id, requested):
     return default_live_account_id(user_id)
 
 
-def _merge_and_upsert_trades(user_id, confirmed_index_rows: list[dict]) -> bool:
+def _merge_and_upsert_trades(user_id, confirmed_index_rows: list[dict], err_out: list | None = None) -> bool:
     """Fetches the user's existing trades, merges in the newly-confirmed
     rows by id, recomputes running equity_after PER ACCOUNT over each
     account's full date-sorted history, and upserts the merged set. Returns
@@ -277,6 +289,8 @@ def _merge_and_upsert_trades(user_id, confirmed_index_rows: list[dict]) -> bool:
         existing = _get_user_trades(user_id)
     except requests.RequestException as e:
         log.error("Get User Trades failed for user %s: %s", user_id, e)
+        if err_out is not None:
+            err_out.append(f"reading existing trades failed: {type(e).__name__}: {e}"[:300])
         return False
 
     default_acct = default_live_account_id(user_id)
@@ -297,6 +311,20 @@ def _merge_and_upsert_trades(user_id, confirmed_index_rows: list[dict]) -> bool:
         equity_by_account[key] = equity_by_account.get(key, 0.0) + (row.get("pnl_after_comm") or 0)
         row["equity_after"] = round(equity_by_account[key], 2)
 
+    # PostgREST rejects a bulk upsert unless EVERY object has the same keys
+    # (PGRST102 "All object keys must match"). Existing rows come back from
+    # `select=*` with every DB column; new rows only carry the index_row
+    # fields. Project all rows onto one shared column set: the new rows'
+    # fields + equity_after (+ account_id when the column exists). Columns
+    # outside that set (created_at etc.) are simply not sent, so the upsert
+    # leaves them untouched.
+    cols = {"id", "user_id", "equity_after"}
+    for r in confirmed_index_rows:
+        cols.update(r.keys())
+    if any("account_id" in r for r in merged):
+        cols.add("account_id")
+    merged = [{c: r.get(c) for c in cols} for r in merged]
+
     try:
         resp = requests.post(
             f"{SUPABASE_URL}/rest/v1/trades",
@@ -306,9 +334,13 @@ def _merge_and_upsert_trades(user_id, confirmed_index_rows: list[dict]) -> bool:
         )
     except requests.RequestException as e:
         log.error("Upsert Trades failed for user %s: %s", user_id, e)
+        if err_out is not None:
+            err_out.append(f"trades upsert request failed: {type(e).__name__}: {e}"[:300])
         return False
     if resp.status_code not in (200, 201):
         log.error("Upsert Trades failed for user %s: HTTP %s %s", user_id, resp.status_code, resp.text[:500])
+        if err_out is not None:
+            err_out.append(f"trades upsert HTTP {resp.status_code}: {resp.text[:250]}")
         return False
     return True
 
@@ -317,42 +349,76 @@ def _merge_and_upsert_trades(user_id, confirmed_index_rows: list[dict]) -> bool:
 # Orchestration -- Combine All Results
 # ---------------------------------------------------------------------------
 
-def publish_trades(trades: list[dict]) -> list[dict]:
+def publish_trades(trades: list[dict], on_event=None) -> list[dict]:
     """Entry point -- takes the enriched trades for ONE broker account
     (the same grouping 'Loop Broker Accounts' / 'Collect Confirmed
     Trades' operated on, since equity_after is only meaningful merged
-    per-user) and runs them through prepare -> publish detail -> merge
-    index -> upsert. Returns a list of {status: 'published'|'failed'|
-    'skipped', id, ...} per trade, mirroring 'Combine All Results'."""
+    per-user) and runs them through prepare -> merge index -> upsert
+    trades -> publish detail (index first: trade_details has a foreign key
+    to trades). Returns a list of {status: 'published'|'failed'|
+    'skipped', id, ...} per trade, mirroring 'Combine All Results'.
+
+    on_event (optional): callable(trade_id, state, reason) invoked as each
+    trade moves through publishing ('publishing', 'saved', 'skipped',
+    'failed', 'published') so a caller (import_routes) can show live
+    per-trade status. Exceptions from the callback are swallowed."""
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are not set")
 
     results = []
-    confirmed = []  # index_row for each trade whose detail publish succeeded
     user_id = None
 
-    for i, trade in enumerate(trades):
-        if i > 0:
-            time.sleep(DETAIL_PUBLISH_PACING_S)
+    def _emit(trade_id, state, reason=""):
+        if on_event:
+            try:
+                on_event(trade_id, state, reason)
+            except Exception as e:  # never let UI reporting break publishing
+                log.warning("publish on_event callback failed (ignored): %s", e)
+
+    # --- A) prepare every trade; trades with no chart data are skipped ---
+    payloads = []
+    for trade in trades:
         payload = prepare_trade_payload(trade)
         if payload["_skip"]:
             log.warning("skipping publish for %s -- final chart had no indicators/bars", payload["id"])
-            results.append({"status": "skipped", "id": payload["id"]})
+            reason = trade.get("_chart_error") or "no chart data (price bars/indicators unavailable for this symbol/date)"
+            results.append({"status": "skipped", "id": payload["id"], "reason": reason})
+            _emit(payload["id"], "skipped", reason)
             continue
-
         user_id = payload["user_id"] or user_id
-        if _publish_trade_detail(payload):
-            confirmed.append(payload["index_row"])
-        else:
-            results.append({"status": "failed", "id": payload["id"], "reason": "trade detail publish failed"})
+        payloads.append(payload)
 
-    if confirmed:
-        if _merge_and_upsert_trades(user_id, confirmed):
-            results.extend({"status": "published", "id": row["id"]} for row in confirmed)
+    if not payloads:
+        return results
+
+    # --- B) trades index FIRST ---
+    # trade_details has a foreign key (user_id, trade_id) -> trades(user_id, id),
+    # so Postgres rejects a detail row whose trade row doesn't exist yet
+    # (HTTP 409, code 23503). The index row therefore has to be written
+    # before the detail row.
+    index_errors: list[str] = []
+    if not _merge_and_upsert_trades(user_id, [p["index_row"] for p in payloads], index_errors):
+        reason = "trades index update failed: " + (index_errors[0] if index_errors else "unknown error")
+        for p in payloads:
+            results.append({"status": "failed", "id": p["id"], "reason": reason})
+            _emit(p["id"], "failed", reason)
+        return results
+    for p in payloads:
+        _emit(p["id"], "saved", "trade row saved, saving chart + verdict details")
+
+    # --- C) detail rows, one at a time ---
+    for i, payload in enumerate(payloads):
+        if i > 0:
+            time.sleep(DETAIL_PUBLISH_PACING_S)
+        _emit(payload["id"], "publishing")
+        if _publish_trade_detail(payload):
+            results.append({"status": "published", "id": payload["id"]})
+            _emit(payload["id"], "published")
         else:
-            results.extend({
-                "status": "failed", "id": row["id"],
-                "reason": "trade detail published but trades index update failed",
-            } for row in confirmed)
+            # The trade row from step B stays; re-running the import retries
+            # the detail (the already-imported check looks at trade_details).
+            reason = payload.get("_error") or "trade detail publish failed"
+            results.append({"status": "failed", "id": payload["id"], "reason": reason})
+            _emit(payload["id"], "failed", reason)
 
     return results
