@@ -275,7 +275,8 @@ def fifo_match_and_merge(raw_trades: list[dict], account: Optional[dict] = None,
                 # charged the same commission again on every partial match.
                 lot_comm_share = lot["commission"] * (match_qty / abs(lot["qty"]))
                 lot["commission"] -= lot_comm_share
-                commission = lot_comm_share + ex["commission"] * (match_qty / abs(ex["qty"]))
+                ex_comm_share = ex["commission"] * (match_qty / abs(ex["qty"]))
+                commission = lot_comm_share + ex_comm_share
                 raw_matches.append({
                     "symbol": sym,
                     "entryDateTime": lot["dateTime"],
@@ -286,6 +287,10 @@ def fifo_match_and_merge(raw_trades: list[dict], account: Optional[dict] = None,
                     "exitPrice": ex["price"],
                     "pnlBeforeComm": pnl_before_comm,
                     "commission": commission,
+                    # The real split: what the broker charged on the opening execution
+                    # (this match's share of it) vs. on the closing execution.
+                    "commissionEntry": lot_comm_share,
+                    "commissionExit": ex_comm_share,
                     "source": ex["source"],
                     "cycle": (sym, cycle),
                 })
@@ -373,7 +378,11 @@ def fifo_match_and_merge(raw_trades: list[dict], account: Optional[dict] = None,
             "qty": m["matchQty"],
             "pnl_before_comm": round(m["pnlBeforeComm"], 2),
             "commission": round(m["commission"], 2),
+            "commission_entry": round(m["commissionEntry"], 4),
+            "commission_exit": round(m["commissionExit"], 4),
         } for m in fills_sorted]
+        comm_in = round(sum(m["commissionEntry"] for m in matches), 2)
+        comm_out = round(round(commission, 2) - comm_in, 2)  # in + out always equals the Commission column
 
         closed_trades.append({
             "_exitDT": exit_dt,
@@ -390,6 +399,8 @@ def fifo_match_and_merge(raw_trades: list[dict], account: Optional[dict] = None,
             "No. of Shares": total_qty,
             "P&L Before Comm": round(pnl_before_comm, 2),
             "Commission": round(commission, 2),
+            "Commission In": comm_in,
+            "Commission Out": comm_out,
             "P&L After Comm": round(pnl_before_comm - commission, 2),
             "Result": "Win" if (pnl_before_comm - commission) >= 0 else "Loss",
             "Fill Count": len(matches),

@@ -164,6 +164,7 @@ def prepare_trade_payload(trade: dict) -> dict:
         "entry_time": detail["entry_time"], "exit_time": detail["exit_time"],
         "entry_price": detail["entry_price"], "exit_price": detail["exit_price"], "shares": detail["shares"],
         "pnl_before_comm": detail["pnl_before_comm"], "commission": detail["commission"],
+        "commission_in": trade.get("Commission In"), "commission_out": trade.get("Commission Out"),
         "pnl_after_comm": detail["pnl_after_comm"], "win": detail["win"], "setup_type": detail["setup_type"],
         "fill_count": detail["fill_count"],
         "verdict_label": trade.get("Verdict") or "",
@@ -292,6 +293,14 @@ def _merge_and_upsert_trades(user_id, confirmed_index_rows: list[dict], err_out:
         if err_out is not None:
             err_out.append(f"reading existing trades failed: {type(e).__name__}: {e}"[:300])
         return False
+
+    # commission_in / commission_out only exist after sql/003_commission_split.sql has been run;
+    # PostgREST rejects unknown keys, so leave them out until a fetched row shows the columns.
+    # (Rows come back from select=* with every column, so one existing trade is enough to tell.)
+    if existing and not any("commission_in" in r for r in existing):
+        for row in confirmed_index_rows:
+            row.pop("commission_in", None)
+            row.pop("commission_out", None)
 
     default_acct = default_live_account_id(user_id)
     by_id = {row["id"]: row for row in existing}

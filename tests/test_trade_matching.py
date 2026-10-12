@@ -59,3 +59,24 @@ if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
             fn(); print("ok", name)
+
+
+def test_commission_is_split_into_entry_and_exit_and_adds_up():
+    # two entries (1.00 + 0.50), one exit of both (1.20): in = 1.50, out = 1.20, total 2.70
+    r = tm.fifo_match_and_merge([
+        mk("Z", "040000", 100, 5, 1.00, "O"), mk("Z", "040030", 50, 5.1, 0.50, "O"),
+        mk("Z", "040500", -150, 5.5, -1.20, "C"),
+    ])
+    t = r[0]
+    assert t["Commission"] == 2.70 and t["Commission In"] == 1.50 and t["Commission Out"] == 1.20
+    assert round(sum(f["commission_entry"] for f in t["Fills"]), 2) == 1.50
+    assert round(sum(f["commission_exit"] for f in t["Fills"]), 2) == 1.20
+
+
+def test_partial_exits_share_the_entry_commission_without_double_counting():
+    r = tm.fifo_match_and_merge([
+        mk("Y", "040000", 100, 5, 1.00, "O"),
+        mk("Y", "040100", -40, 5.2, 0.40, "C"), mk("Y", "040200", -60, 5.3, 0.60, "C"),
+    ])
+    t = r[0]
+    assert t["Commission In"] == 1.00 and t["Commission Out"] == 1.00 and t["Commission"] == 2.00
