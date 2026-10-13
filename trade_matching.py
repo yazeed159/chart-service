@@ -36,6 +36,8 @@ one later.
 
 from __future__ import annotations
 
+import csv
+import io
 import re
 from datetime import datetime
 from typing import Any, Optional
@@ -54,6 +56,12 @@ CSV_ALIASES = {
     # Broker's unique per-fill id, used (when present) to de-dupe precisely.
     "execId": ["ibexecid", "execid", "executionid", "tradeid"],
     "levelOfDetail": ["levelofdetail"],
+    # Which broker ORDER an execution belongs to (several fills of one order share it),
+    # the venue it filled on, and facts about the stock itself.
+    "orderId": ["iborderid", "orderid", "brokerageorderid"],
+    "exchange": ["exchange"],
+    "country": ["issuercountrycode"],
+    "subCategory": ["subcategory"],
 }
 
 
@@ -140,6 +148,74 @@ def keep_execution_level(items: list, level_of) -> list:
     return [i for i in items if str(level_of(i) or "").strip().upper() == want]
 
 
+def read_csv_sections(raw: str) -> tuple[list[dict], list[dict]]:
+    """Split a broker CSV into (trade_rows, fee_rows).
+
+    An IBKR export can hold several sections in ONE file, each starting with its own header
+    line (the first cell is the same, e.g. ClientAccountID). Reading the whole file with a single
+    header misaligns every row after the second header -- so each section is read against its OWN
+    header. A section whose header has TaxAmount is the taxes/regulatory-fees section; everything
+    else is treated as trades (a hand-made single-header CSV is just one trades section)."""
+    trades: list[dict] = []
+    fees: list[dict] = []
+    header: list[str] | None = None
+    first_cell = None
+    for cells in csv.reader(io.StringIO(raw)):
+        if not any(c.strip() for c in cells):
+            continue
+        norm = [_norm_key(c) for c in cells]
+        is_header = header is None or (first_cell is not None and norm[0] == first_cell and "symbol" in norm)
+        if is_header:
+            header = cells
+            first_cell = norm[0]
+            continue
+        row = dict(zip(header, cells))
+        (fees if "taxamount" in {_norm_key(h) for h in header} else trades).append(row)
+    return trades, fees
+
+
+def parse_csv_fees(rows: list[dict]) -> list[dict]:
+    """Taxes / regulatory-fee rows (SEC fee, FINRA TAF, ...) -> [{symbol, orderId, amount, description}].
+    Tied to a trade later through the broker order id."""
+    out = []
+    for r in rows:
+        try:
+            amount = abs(float(_find_csv_field(r, ["taxamount"]) or 0))
+        except (TypeError, ValueError):
+            continue
+        if not amount:
+            continue
+        out.append({
+            "symbol": _find_csv_field(r, CSV_ALIASES["symbol"]),
+            "orderId": str(_find_csv_field(r, ["orderid", "iborderid"]) or "") or None,
+            "amount": amount,
+            "description": _find_csv_field(r, ["taxdescription"]) or "",
+        })
+    return out
+
+
+def parse_flex_fees(flex_doc: dict) -> list[dict]:
+    """Same, from a Flex XML statement's TransactionTaxes section when the query includes it
+    (returns [] otherwise)."""
+    try:
+        stmts = as_list_helper(flex_doc["FlexQueryResponse"]["FlexStatements"].get("FlexStatement"))
+    except (KeyError, TypeError, AttributeError):
+        return []
+    out = []
+    for stmt in stmts:
+        sec = (stmt or {}).get("TransactionTaxes") or {}
+        for t in as_list_helper(sec.get("TransactionTax")):
+            try:
+                amount = abs(float(t.get("taxAmount") or 0))
+            except (TypeError, ValueError):
+                continue
+            if amount:
+                oid = t.get("orderID") or t.get("ibOrderID")
+                out.append({"symbol": t.get("symbol"), "orderId": str(oid) if oid else None,
+                            "amount": amount, "description": t.get("taxDescription") or ""})
+    return out
+
+
 def _is_repeated_header_row(row: dict) -> bool:
     """Some broker exports paste a second header line mid-file (the section
     changes). Its 'symbol' cell literally says 'Symbol' -- never a trade."""
@@ -187,6 +263,10 @@ def parse_csv_executions(rows: list[dict]) -> list[dict]:
             "tradePrice": trade_price,
             "commission": commission,
             "openClose": open_close,
+            "orderId": _find_csv_field(row, CSV_ALIASES["orderId"]),
+            "exchange": _find_csv_field(row, CSV_ALIASES["exchange"]),
+            "country": _find_csv_field(row, CSV_ALIASES["country"]),
+            "subCategory": _find_csv_field(row, CSV_ALIASES["subCategory"]),
             "_source": "csv",
         })
     return raw_trades
@@ -197,7 +277,7 @@ def _sign(x: float) -> int:
 
 
 def fifo_match_and_merge(raw_trades: list[dict], account: Optional[dict] = None,
-                         skipped: Optional[list] = None) -> list[dict]:
+                         skipped: Optional[list] = None, fees: Optional[list] = None) -> list[dict]:
     """Shared FIFO-matching + same-order-fill-merging logic for both the
     CSV import path and the (future) daily Flex path.
 
@@ -240,6 +320,10 @@ def fifo_match_and_merge(raw_trades: list[dict], account: Optional[dict] = None,
             "commission": abs(float(e.get("commission") or 0)),
             "source": e.get("_source"),
             "close_only": _is_close_only(e.get("openClose")),
+            "order_id": str(e["orderId"]) if e.get("orderId") else None,
+            "exchange": e.get("exchange") or None,
+            "country": e.get("country") or None,
+            "sub_category": e.get("subCategory") or None,
         })
     executions.sort(key=lambda ex: ex["dateTime"])
 
@@ -292,6 +376,9 @@ def fifo_match_and_merge(raw_trades: list[dict], account: Optional[dict] = None,
                     "commissionEntry": lot_comm_share,
                     "commissionExit": ex_comm_share,
                     "source": ex["source"],
+                    "entryOrder": lot.get("order_id"), "exitOrder": ex["order_id"],
+                    "entryExchange": lot.get("exchange"), "exitExchange": ex["exchange"],
+                    "country": ex["country"], "subCategory": ex["sub_category"],
                     "cycle": (sym, cycle),
                 })
                 matched_any = True
@@ -317,6 +404,7 @@ def fifo_match_and_merge(raw_trades: list[dict], account: Optional[dict] = None,
                 queue.append({
                     "qty": remaining, "price": ex["price"], "dateTime": ex["dateTime"],
                     "commission": ex["commission"], "source": ex["source"],
+                    "order_id": ex["order_id"], "exchange": ex["exchange"],
                 })
             elif matched_any and not queue:
                 cycle += 1  # exactly flat: next execution starts a new position
@@ -347,6 +435,20 @@ def fifo_match_and_merge(raw_trades: list[dict], account: Optional[dict] = None,
                 "first_time": format_time(min(m["entryDateTime"] for m in ms)),
                 "date": format_date(min(m["entryDateTime"] for m in ms)),
             })
+
+    # Regulatory fees (SEC / FINRA TAF ...) are charged per ORDER. Share each fee across the
+    # matches that belong to that order (by the shares they cover), so a trade's fees are exactly
+    # the fees of the orders it was built from. A fee whose order is in no kept trade is dropped.
+    fee_by_match: dict[int, float] = {}
+    if fees:
+        for fee in fees:
+            oid = fee.get("orderId")
+            if not oid:
+                continue
+            hit = [m for ms in groups.values() for m in ms if oid in (m.get("entryOrder"), m.get("exitOrder"))]
+            qty = sum(m["matchQty"] for m in hit)
+            for m in hit:
+                fee_by_match[id(m)] = fee_by_match.get(id(m), 0.0) + fee["amount"] * m["matchQty"] / qty
 
     closed_trades = []
     for key, matches in groups.items():
@@ -380,7 +482,21 @@ def fifo_match_and_merge(raw_trades: list[dict], account: Optional[dict] = None,
             "commission": round(m["commission"], 2),
             "commission_entry": round(m["commissionEntry"], 4),
             "commission_exit": round(m["commissionExit"], 4),
+            # Broker order each side belongs to (fills of ONE order share an id) and the venue.
+            "entry_order": m["entryOrder"], "exit_order": m["exitOrder"],
+            "entry_exchange": m["entryExchange"], "exit_exchange": m["exitExchange"],
         } for m in fills_sorted]
+        trade_fees = round(sum(fee_by_match.get(id(m), 0.0) for m in matches), 2)
+        # Per exchange: shares executed there and the commission the broker charged on them.
+        venues: dict[str, dict] = {}
+        for m in matches:
+            for ven, comm_side in ((m["entryExchange"], m["commissionEntry"]), (m["exitExchange"], m["commissionExit"])):
+                if not ven:
+                    continue
+                v = venues.setdefault(ven, {"sh": 0.0, "comm": 0.0})
+                v["sh"] += m["matchQty"]
+                v["comm"] += comm_side
+        venues = {k: {"sh": round(v["sh"], 2), "comm": round(v["comm"], 4)} for k, v in venues.items()}
         comm_in = round(sum(m["commissionEntry"] for m in matches), 2)
         comm_out = round(round(commission, 2) - comm_in, 2)  # in + out always equals the Commission column
 
@@ -401,6 +517,10 @@ def fifo_match_and_merge(raw_trades: list[dict], account: Optional[dict] = None,
             "Commission": round(commission, 2),
             "Commission In": comm_in,
             "Commission Out": comm_out,
+            "Fees": trade_fees,
+            "Venues": venues or None,
+            "Issuer Country": next((m["country"] for m in matches if m["country"]), None),
+            "Sub Category": next((m["subCategory"] for m in matches if m["subCategory"]), None),
             "P&L After Comm": round(pnl_before_comm - commission, 2),
             "Result": "Win" if (pnl_before_comm - commission) >= 0 else "Loss",
             "Fill Count": len(matches),
@@ -472,6 +592,10 @@ def parse_flex_executions(flex_doc: dict) -> list[dict]:
                 "tradePrice": trade.get("price"),
                 "commission": trade.get("commission") or 0,
                 "openClose": trade.get("openCloseIndicator"),
+                "orderId": trade.get("ibOrderID") or trade.get("orderID"),
+                "exchange": trade.get("exchange"),
+                "country": trade.get("issuerCountryCode"),
+                "subCategory": trade.get("subCategory"),
                 "_source": "daily",
             })
     return raw_trades

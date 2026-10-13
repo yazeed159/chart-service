@@ -81,7 +81,7 @@ from pathlib import Path
 
 from flask import Blueprint, request, jsonify
 
-from trade_matching import parse_csv_executions, fifo_match_and_merge, looks_like_csv_row
+from trade_matching import parse_csv_executions, fifo_match_and_merge, looks_like_csv_row, read_csv_sections, parse_csv_fees
 from supabase_auth import resolve_user_id
 
 log = logging.getLogger("chart_service.import_routes")
@@ -275,8 +275,7 @@ def import_trades():
     except UnicodeDecodeError:
         return jsonify({"error": "couldn't read the file as UTF-8 text -- is it really a CSV?"}), 400
 
-    reader = csv.DictReader(io.StringIO(raw))
-    rows = list(reader)
+    rows, fee_rows = read_csv_sections(raw)   # each section (trades, taxes/fees) against its own header
     if not rows:
         return jsonify({"error": "CSV had no data rows"}), 400
 
@@ -295,7 +294,8 @@ def import_trades():
     try:
         from publish import resolve_account_id  # lazy import, same pattern as elsewhere in this service
         target_account = resolve_account_id(user_id, (request.form.get("account_id") or "").strip() or None)
-        closed_trades = fifo_match_and_merge(raw_executions, account={"user_id": user_id, "account_id": target_account}, skipped=ignored)
+        closed_trades = fifo_match_and_merge(raw_executions, account={"user_id": user_id, "account_id": target_account}, skipped=ignored,
+                                             fees=parse_csv_fees(fee_rows))
     except Exception as e:
         log.error("import-trades: FIFO matching failed: %s", e)
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
@@ -325,7 +325,10 @@ def import_trades():
     th = threading.Thread(target=_run_import_job, args=(job_id, closed_trades, cancel_event, skip_ids), daemon=True)
     th.start()
 
-    return jsonify({"job_id": job_id, "trades": closed_trades, "skipped_rows": skipped,
+    fee_list = parse_csv_fees(fee_rows)
+    fee_info = {"rows": len(fee_list), "total": round(sum(f["amount"] for f in fee_list), 2),
+                "attached": round(sum(t.get("Fees") or 0 for t in closed_trades), 2)}
+    return jsonify({"job_id": job_id, "trades": closed_trades, "skipped_rows": skipped, "fee_info": fee_info,
                     "ignored_incomplete": ignored,
                     "already_imported": sorted(skip_ids), "existing_check_failed": lookup_failed}), 202
 

@@ -77,7 +77,7 @@ import requests
 from flask import Blueprint, jsonify
 
 from flex_xml import parse_flex_xml
-from trade_matching import fifo_match_and_merge, parse_flex_executions
+from trade_matching import fifo_match_and_merge, parse_flex_executions, parse_flex_fees
 from publish import publish_trades
 import symbol_info_store
 
@@ -697,7 +697,7 @@ def process_account(account: dict) -> list[dict]:
     flex_doc = request_flex_statement(account)
     raw_executions = parse_flex_executions(flex_doc)
     ignored: list = []
-    closed_trades = fifo_match_and_merge(raw_executions, account=account, skipped=ignored)
+    closed_trades = fifo_match_and_merge(raw_executions, account=account, skipped=ignored, fees=parse_flex_fees(flex_doc))
 
     log.info("account %s: %d executions -> %d closed trades", account.get("id"), len(raw_executions), len(closed_trades))
     for ig in ignored:

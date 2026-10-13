@@ -165,6 +165,8 @@ def prepare_trade_payload(trade: dict) -> dict:
         "entry_price": detail["entry_price"], "exit_price": detail["exit_price"], "shares": detail["shares"],
         "pnl_before_comm": detail["pnl_before_comm"], "commission": detail["commission"],
         "commission_in": trade.get("Commission In"), "commission_out": trade.get("Commission Out"),
+        "issuer_country": trade.get("Issuer Country"), "sub_category": trade.get("Sub Category"),
+        "fees": trade.get("Fees"), "venues": trade.get("Venues"),
         "pnl_after_comm": detail["pnl_after_comm"], "win": detail["win"], "setup_type": detail["setup_type"],
         "fill_count": detail["fill_count"],
         "verdict_label": trade.get("Verdict") or "",
@@ -301,6 +303,16 @@ def _merge_and_upsert_trades(user_id, confirmed_index_rows: list[dict], err_out:
         for row in confirmed_index_rows:
             row.pop("commission_in", None)
             row.pop("commission_out", None)
+    # same for the stock facts (sql/004_trade_facts.sql)
+    if existing and not any("issuer_country" in r for r in existing):
+        for row in confirmed_index_rows:
+            row.pop("issuer_country", None)
+            row.pop("sub_category", None)
+    # and for fees + per-exchange stats (sql/005_fees_and_venues.sql)
+    if existing and not any("venues" in r for r in existing):
+        for row in confirmed_index_rows:
+            row.pop("fees", None)
+            row.pop("venues", None)
 
     default_acct = default_live_account_id(user_id)
     by_id = {row["id"]: row for row in existing}

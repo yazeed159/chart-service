@@ -80,3 +80,50 @@ def test_partial_exits_share_the_entry_commission_without_double_counting():
     ])
     t = r[0]
     assert t["Commission In"] == 1.00 and t["Commission Out"] == 1.00 and t["Commission"] == 2.00
+
+
+def test_order_ids_exchange_and_stock_facts_ride_along_on_fills():
+    rows = [
+        {"Symbol": "Q", "DateTime": "20261006;040000", "Quantity": "60", "TradePrice": "5", "IBCommission": "-0.6", "Buy/Sell": "BUY",
+         "Open/CloseIndicator": "O", "LevelOfDetail": "EXECUTION", "IBOrderID": "11", "Exchange": "ARCA", "IssuerCountryCode": "CN", "SubCategory": "ADR", "IBExecID": "a"},
+        {"Symbol": "Q", "DateTime": "20261006;040000", "Quantity": "40", "TradePrice": "5.01", "IBCommission": "-0.4", "Buy/Sell": "BUY",
+         "Open/CloseIndicator": "O", "LevelOfDetail": "EXECUTION", "IBOrderID": "11", "Exchange": "MEMX", "IssuerCountryCode": "CN", "SubCategory": "ADR", "IBExecID": "b"},
+        {"Symbol": "Q", "DateTime": "20261006;040100", "Quantity": "-100", "TradePrice": "5.2", "IBCommission": "-1", "Buy/Sell": "SELL",
+         "Open/CloseIndicator": "C", "LevelOfDetail": "EXECUTION", "IBOrderID": "12", "Exchange": "ARCA", "IssuerCountryCode": "CN", "SubCategory": "ADR", "IBExecID": "c"},
+    ]
+    t = tm.fifo_match_and_merge(tm.parse_csv_executions(rows))[0]
+    assert t["Issuer Country"] == "CN" and t["Sub Category"] == "ADR"
+    assert {f["entry_order"] for f in t["Fills"]} == {"11"} and {f["exit_order"] for f in t["Fills"]} == {"12"}
+    assert {f["entry_exchange"] for f in t["Fills"]} == {"ARCA", "MEMX"}
+
+
+def test_two_section_csv_is_read_against_each_sections_own_header():
+    raw = (
+        "ClientAccountID,Symbol,DateTime,Quantity,TradePrice,IBCommission,Buy/Sell,Open/CloseIndicator,LevelOfDetail,IBOrderID,Exchange\n"
+        "A1,Q,20261006;040000,100,5,-1,BUY,O,EXECUTION,11,ARCA\n"
+        "A1,Q,20261006;040100,-100,5.2,-1,SELL,C,EXECUTION,12,MEMX\n"
+        "ClientAccountID,Symbol,Date,TaxDescription,TaxAmount,OrderID\n"
+        "A1,Q,20261006,SEC Fee,-0.03,12\n"
+        "A1,Q,20261006,FINRA TAF,-0.01,12\n"
+    )
+    trade_rows, fee_rows = tm.read_csv_sections(raw)
+    assert len(trade_rows) == 2 and len(fee_rows) == 2
+    fees = tm.parse_csv_fees(fee_rows)
+    t = tm.fifo_match_and_merge(tm.parse_csv_executions(trade_rows), fees=fees)[0]
+    assert t["Fees"] == 0.04
+    assert t["Venues"] == {"ARCA": {"sh": 100.0, "comm": 1.0}, "MEMX": {"sh": 100.0, "comm": 1.0}}
+    # fees never change the commission / P&L columns
+    assert t["Commission"] == 2.0
+
+
+def test_fee_on_a_shared_order_is_split_by_shares_and_a_header_only_section_is_harmless():
+    raw = (
+        "ClientAccountID,Symbol,DateTime,Quantity,TradePrice,IBCommission,Buy/Sell,Open/CloseIndicator,LevelOfDetail,IBOrderID\n"
+        "A1,Q,20261006;040000,100,5,-1,BUY,O,EXECUTION,11\n"
+        "A1,Q,20261006;040100,-100,5.2,-1,SELL,C,EXECUTION,12\n"
+        "ClientAccountID,Symbol,Date,TaxDescription,TaxAmount,OrderID\n"
+    )
+    rows, fee_rows = tm.read_csv_sections(raw)
+    assert fee_rows == [] and len(rows) == 2
+    t = tm.fifo_match_and_merge(tm.parse_csv_executions(rows), fees=tm.parse_csv_fees(fee_rows))[0]
+    assert t["Fees"] == 0.0

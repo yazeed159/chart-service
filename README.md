@@ -49,6 +49,15 @@ replaced, but there's no n8n in the loop anymore.
   immediately, does the real work in a background thread, merges results
   into that run's own report via `/backtest/history/<job_id>/enrich`.
 
+**Execution data kept through matching** (`trade_matching.py`)
+- Per fill: real commission on the entry and on the exit (`commission_entry / commission_exit`), broker order id and
+  exchange for each side. Per trade: `Commission In / Out` (always sums to `Commission`), `Venues`
+  (`{exchange: {sh, comm}}`), `Issuer Country`, `Sub Category`, `Fees`.
+- `read_csv_sections` reads each section of an IBKR CSV against its own header (trades, taxes/fees);
+  fee rows are tied to trades through the order id. `/import-trades` returns `fee_info`.
+- `publish.py` only sends `commission_in/out`, `issuer_country/sub_category`, `fees/venues` once the matching
+  columns exist (frontend repo: `sql/003`-`005`).
+
 **Daily sync** (`daily_sync.py` + `publish.py`)
 - `POST /daily-sync` — for each connected broker account: pull the IBKR
   Flex report, FIFO-match fills, generate chart + AI verdict per trade,
