@@ -312,6 +312,26 @@ def save_account_report(account: dict, report: dict):
         log.warning("could not save %s for account %s: %s", REPORT_KEY, aid, e)
 
 
+def _fmt_fill_time(raw) -> str:
+    """'20261012;093005' / '2026-10-12 09:30:05' -> '2026-10-12 09:30' (lenient; '' if unparseable)."""
+    d = "".join(ch for ch in str(raw or "") if ch.isdigit())
+    return f"{d[0:4]}-{d[4:6]}-{d[6:8]} {d[8:10]}:{d[10:12]}" if len(d) >= 12 else (f"{d[0:4]}-{d[4:6]}-{d[6:8]}" if len(d) == 8 else "")
+
+
+def statement_info(flex_doc: dict, raw_executions: list, closed_count: int) -> dict:
+    """What IBKR actually sent -- the first thing to check when 'my trades are not showing up':
+    the period the statement covers and the latest fill in it."""
+    stmts = ((flex_doc.get("FlexQueryResponse") or {}).get("FlexStatements") or {}).get("FlexStatement") or []
+    st = (stmts[0] if isinstance(stmts, list) and stmts else stmts) or {}
+    st = st if isinstance(st, dict) else {}
+    times = sorted(_fmt_fill_time(r.get("dateTime")) for r in raw_executions if r.get("dateTime"))
+    return {
+        "from": str(st.get("fromDate") or ""), "to": str(st.get("toDate") or ""),
+        "period": str(st.get("period") or ""), "generated": str(st.get("whenGenerated") or ""),
+        "fills": len(raw_executions), "closed": closed_count, "latest_fill": times[-1] if times else "",
+    }
+
+
 def build_report(account: dict, publish_results: list[dict]) -> dict:
     """Everything the sync saw but did NOT turn into a saved trade, for the Accounts page."""
     skipped = [dict(ig) for ig in (account.get("_ignored") or [])]
@@ -324,6 +344,7 @@ def build_report(account: dict, publish_results: list[dict]) -> dict:
         "no_chart": account.get("_stuck") or [],
         "skipped": skipped,
         "deferred": int(account.get("_deferred") or 0),
+        "statement": account.get("_statement") or {},
     }
 
 
@@ -901,6 +922,7 @@ def process_account(account: dict) -> list[dict]:
     closed_trades = fifo_match_and_merge(raw_executions, account=account, skipped=ignored, fees=parse_flex_fees(flex_doc),
                                          open_positions=open_positions)
     account["_ignored"], account["_open"], account["_stuck"] = ignored, open_positions, []
+    account["_statement"] = statement_info(flex_doc, raw_executions, len(closed_trades))
 
     # The statement's own account must match the one the user said this token belongs to.
     ref = (account.get("ibkr_account_ref") or "").strip().upper()
@@ -968,14 +990,15 @@ def process_account(account: dict) -> list[dict]:
     return enriched
 
 
-def run_daily_sync() -> dict:
+def run_daily_sync(accounts: list | None = None) -> dict:
     """Entry point -- one broker account at a time (matches "Loop Broker
     Accounts"'s batchSize: 1). Each account's enriched trades are then run
     through publish.py's Supabase publish step (mirrors "Combine All
     Results" happening once per account/batch in n8n). Returns
     {accounts: [{account_id, trades: [...], publish_results: [...],
     error: str|null}, ...]}."""
-    accounts = get_broker_accounts()
+    if accounts is None:
+        accounts = get_broker_accounts()
     results = []
     for n, account in enumerate(accounts):
         if n > 0:
@@ -1007,6 +1030,10 @@ def run_daily_sync() -> dict:
                 report_status(account, "failed", f"{published} saved, {failed} failed to save")
             else:
                 msg = f"{published} new trade(s)" if published else "No new trades"
+                sti = account.get("_statement") or {}
+                if not published and sti:
+                    msg += (f" (IBKR sent {sti.get('fills', 0)} fill(s), latest {sti['latest_fill']})" if sti.get("fills")
+                            else " (IBKR's statement had no fills" + (f" for {sti['from']} to {sti['to']}" if sti.get("from") else "") + ")")
                 if account.get("_deferred"):
                     msg += f", {account['_deferred']} more waiting for the next run"
                 stuck = (account.get("_failed") or []) + (account.get("_cooling") or [])
@@ -1084,3 +1111,60 @@ def daily_sync():
         raise
     log.info("daily-sync job %s: started", job_id)
     return jsonify({"started": job_id}), 202
+
+
+
+# ---------------------------------------------------------------------------
+# "Sync now" button on the Accounts page: one account, the logged-in user's own.
+# Auth is the user's Supabase token (like /import-trades), not the cron secret.
+# It shares the cron's lock (never two runs at once -- IBKR rate-limits Flex) and has a
+# short per-account cooldown so a double-click or an impatient tap can't hammer IBKR.
+# ---------------------------------------------------------------------------
+MANUAL_SYNC_COOLDOWN_S = float(os.environ.get("SYNC_NOW_COOLDOWN_SECONDS", "90"))
+_manual_last: dict[str, float] = {}
+
+
+@bp.route("/sync-now", methods=["POST", "OPTIONS"])
+def sync_now():
+    from flask import request
+    from supabase_auth import resolve_user_id
+    if request.method == "OPTIONS":
+        return "", 204
+    user_id = resolve_user_id(request.headers.get("Authorization"))
+    if not user_id:
+        return jsonify({"error": "missing or invalid Authorization token -- please log in and try again"}), 401
+    account_id = str((request.get_json(silent=True) or {}).get("account_id") or "").strip()
+    if not account_id:
+        return jsonify({"error": "account_id is required"}), 400
+
+    try:
+        mine = [a for a in get_broker_accounts()
+                if a.get("user_id") == user_id and account_id in (str(a.get("id")), str(a.get("account_id")))]
+    except Exception as e:
+        log.error("sync-now: could not load accounts: %s", e)
+        return jsonify({"error": "could not read your broker connection -- try again in a minute"}), 503
+    if not mine:
+        return jsonify({"error": "this account has no connected Flex token and query yet"}), 404
+
+    wait = MANUAL_SYNC_COOLDOWN_S - (time.time() - _manual_last.get(account_id, 0))
+    if wait > 0:
+        return jsonify({"error": f"just synced -- wait {int(wait) + 1}s before pulling again"}), 429
+    if not _daily_sync_lock.acquire(blocking=False):
+        return jsonify({"error": "a sync is already running -- give it a few minutes, then check the status here"}), 409
+    _manual_last[account_id] = time.time()
+
+    def _run(accts):
+        try:
+            run_daily_sync(accounts=accts)
+        except Exception as e:   # run_daily_sync reports per-account failures itself; this is a last resort
+            log.error("sync-now for %s crashed: %s", account_id, e)
+        finally:
+            _daily_sync_lock.release()
+
+    try:
+        threading.Thread(target=_run, args=(mine,), daemon=True).start()
+    except Exception:
+        _daily_sync_lock.release()
+        raise
+    log.info("sync-now: started for account %s (user %s)", account_id, user_id)
+    return jsonify({"started": True}), 202

@@ -32,8 +32,58 @@ def test_build_report_collects_open_stuck_skipped_and_failed_saves():
     assert [s["symbol"] for s in r["skipped"]] == ["CCC", "EEE"] and "db down" in r["skipped"][1]["reason"]
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # (sync-now tests need only flask)
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
             fn()
     print("ok")
+
+
+# ---- /sync-now (the "Sync now" button) ----
+def _client(monkeypatch_user="u1", accounts=None):
+    from flask import Flask
+    import supabase_auth
+    supabase_auth.resolve_user_id = lambda h: monkeypatch_user if h == "Bearer good" else None
+    ds.get_broker_accounts = lambda: accounts if accounts is not None else [
+        {"id": "acc1", "account_id": "acc1", "user_id": "u1"}, {"id": "acc2", "account_id": "acc2", "user_id": "u2"}]
+    started = []
+    ds.run_daily_sync = lambda accounts=None: started.append([a["id"] for a in accounts])
+    ds._manual_last.clear()
+    app = Flask(__name__); app.register_blueprint(ds.bp)
+    return app.test_client(), started
+
+
+def test_sync_now_requires_login_and_an_account():
+    c, _ = _client()
+    assert c.post("/sync-now", json={"account_id": "acc1"}).status_code == 401
+    assert c.post("/sync-now", json={}, headers={"Authorization": "Bearer good"}).status_code == 400
+
+
+def test_sync_now_only_syncs_the_callers_own_account():
+    c, started = _client()
+    h = {"Authorization": "Bearer good"}
+    assert c.post("/sync-now", json={"account_id": "acc2"}, headers=h).status_code == 404   # someone else's
+    r = c.post("/sync-now", json={"account_id": "acc1"}, headers=h)
+    assert r.status_code == 202
+    import time; time.sleep(0.3)
+    assert started == [["acc1"]]
+
+
+def test_sync_now_cooldown_and_running_lock():
+    c, _ = _client()
+    h = {"Authorization": "Bearer good"}
+    assert c.post("/sync-now", json={"account_id": "acc1"}, headers=h).status_code == 202
+    import time; time.sleep(0.3)
+    assert c.post("/sync-now", json={"account_id": "acc1"}, headers=h).status_code == 429
+    ds._manual_last.clear()
+    ds._daily_sync_lock.acquire()
+    try:
+        assert c.post("/sync-now", json={"account_id": "acc1"}, headers=h).status_code == 409
+    finally:
+        ds._daily_sync_lock.release()
+
+
+def test_statement_info_reports_period_and_latest_fill():
+    doc = {"FlexQueryResponse": {"FlexStatements": {"FlexStatement": {"fromDate": "20261012", "toDate": "20261012", "period": "LastBusinessDay"}}}}
+    i = ds.statement_info(doc, [{"dateTime": "20261012;155830"}, {"dateTime": "20261012;093005"}], 1)
+    assert i["fills"] == 2 and i["latest_fill"] == "2026-10-12 15:58" and i["from"] == "20261012" and i["closed"] == 1
