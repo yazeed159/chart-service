@@ -1,7 +1,9 @@
 name: Daily IBKR sync trigger
 
-# Replaces n8n's "Daily 8PM Egypt Trigger" (Schedule Trigger). Egypt is
-# UTC+2 (no DST since 2016), so 20:00 Cairo = 18:00 UTC year-round.
+# Every 2 hours during the US trading day, plus once after the close. Each run is cheap: it asks IBKR
+# for the day's statement and only charts / asks the AI about trades that aren't saved yet.
+# 13:05-21:05 UTC covers the US session whether or not US daylight time is in effect, and
+# 22:30 UTC is the after-close catch-up. (Cairo is UTC+3 in summer, UTC+2 in winter.)
 # GitHub Actions cron is UTC and best-effort (can slip a few minutes under
 # load) -- fine for a daily job. This also doubles as the free-tier
 # wake-up ping: it's just a POST, chart_service.py does the real work in
@@ -9,7 +11,8 @@ name: Daily IBKR sync trigger
 
 on:
   schedule:
-    - cron: "0 18 * * *"
+    - cron: "5 13-21/2 * * 1-5"
+    - cron: "30 22 * * 1-5"
   workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
 
 jobs:

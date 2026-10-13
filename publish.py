@@ -111,7 +111,9 @@ def prepare_trade_payload(trade: dict) -> dict:
     broker_account_id = trade.get("_broker_account_id")
     account_id = trade.get("_account_id")
 
-    if not indicators or not bars:
+    if trade.get("_bare"):   # gave up charting (see daily_sync.MAX_CHART_ATTEMPTS): save the trade without chart data
+        indicators, bars = indicators or {}, bars or []
+    elif not indicators or not bars:
         return {
             "_skip": True, "status": "skipped", "id": trade_id,
             "symbol": trade.get("Symbol"), "trade_date": trade_date,

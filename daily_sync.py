@@ -109,6 +109,14 @@ SEND_RETRY_MAX_TRIES = 5
 # work (shared Polygon rate limit), the final (post-verdict) call isn't
 # separately paced since it follows right after the same trade's Gemini call.
 CHART_PACING_SECONDS = 13
+ACCOUNT_PAUSE_SECONDS = 5   # between accounts: IBKR throttles Flex requests
+# Cost guards. A trade whose chart can't be built is retried on later runs, but only this many
+# times; after that it is saved bare (trade row, no chart/verdict) and never retried by the sync.
+MAX_CHART_ATTEMPTS = int(os.environ.get("SYNC_MAX_CHART_ATTEMPTS", "2"))
+# At most this many NEW trades get a chart + AI verdict per account per run; the rest wait for
+# the next run (they are not saved yet, so they are picked up again automatically).
+MAX_NEW_TRADES_PER_RUN = int(os.environ.get("SYNC_MAX_NEW_TRADES_PER_RUN", "15"))
+ATTEMPTS_KEY = "sync_attempts"   # user_kv: {trade_id: failed chart attempts}
 GEMINI_TIMEOUT_S = 30  # matches Vision LLM Analysis's node timeout
 
 DAILY_SYNC_RUNS_DIR = Path(os.environ.get("DAILY_SYNC_RUNS_DIR", "daily_sync_runs"))
@@ -136,20 +144,104 @@ def _telegram_send(chat_id, text: str):
 # Broker accounts (Supabase)
 # ---------------------------------------------------------------------------
 
-def get_broker_accounts() -> list[dict]:
-    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are not set")
-    resp = requests.get(
-        f"{SUPABASE_URL}/rest/v1/broker_accounts",
-        params={"select": "*"},
-        headers={
-            "apikey": SUPABASE_SERVICE_ROLE_KEY,
-            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-        },
-        timeout=30,
-    )
+def _sb_headers() -> dict:
+    return {"apikey": SUPABASE_SERVICE_ROLE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"}
+
+
+def _sb_get(table: str, params: dict) -> list[dict]:
+    resp = requests.get(f"{SUPABASE_URL}/rest/v1/{table}", params=params, headers=_sb_headers(), timeout=30)
     resp.raise_for_status()
     return resp.json()
+
+
+def get_broker_accounts() -> list[dict]:
+    """The accounts to sync. Each active account with its own Flex token + query ID
+    (table account_flex, edited on the site's Accounts page) is one entry. Users with NO
+    account_flex rows fall back to the old single-token broker_accounts row, so nothing
+    stops syncing before someone has re-entered their keys per account."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are not set")
+    legacy = _sb_get("broker_accounts", {"select": "*"})
+    legacy_by_user = {r.get("user_id"): r for r in legacy}
+
+    try:
+        flex_rows = _sb_get("account_flex", {"select": "*"})
+        acct_rows = _sb_get("accounts", {"select": "id,user_id,name,status"})
+    except requests.RequestException as e:
+        # table not created yet: behave exactly as before
+        log.warning("account_flex/accounts not readable (%s) -- using broker_accounts only", e)
+        return legacy
+
+    active = {a["id"]: a for a in acct_rows if a.get("status") != "archived"}
+    out, users_with_flex = [], set()
+    for r in flex_rows:
+        users_with_flex.add(r.get("user_id"))
+        a = active.get(r.get("account_id"))
+        if not a or not r.get("ibkr_flex_token") or not r.get("ibkr_flex_query_id"):
+            continue  # archived account, or keys not filled in yet
+        out.append({
+            "id": a["id"], "account_id": a["id"], "user_id": a.get("user_id") or r.get("user_id"),
+            "name": a.get("name"), "ibkr_flex_token": r["ibkr_flex_token"],
+            "ibkr_flex_query_id": r["ibkr_flex_query_id"], "ibkr_account_ref": r.get("ibkr_account_ref"),
+            "telegram_chat_id": (legacy_by_user.get(r.get("user_id")) or {}).get("telegram_chat_id"),
+            "_source": "account_flex",
+        })
+    out.extend(r for r in legacy if r.get("user_id") not in users_with_flex)
+    return out
+
+
+def existing_trade_ids(user_id) -> set:
+    """Trade ids this user already has saved WITH their detail row (a trade whose detail
+    failed to save last time is retried)."""
+    ids = {r["id"] for r in _sb_get("trades", {"user_id": f"eq.{user_id}", "select": "id"})}
+    have_detail = {r["trade_id"] for r in _sb_get("trade_details", {"user_id": f"eq.{user_id}", "select": "trade_id"})}
+    return ids & have_detail
+
+
+def report_status(account: dict, status: str, message: str):
+    """Write last_sync_* back so the chip on the Accounts page shows what happened."""
+    if account.get("_source") != "account_flex":
+        return
+    try:
+        resp = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/account_flex",
+            params={"account_id": f"eq.{account['account_id']}"},
+            json={"last_sync_at": datetime.utcnow().isoformat() + "Z", "last_sync_status": status,
+                  "last_sync_message": (message or "")[:300]},
+            headers={**_sb_headers(), "Content-Type": "application/json"}, timeout=15,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        log.warning("could not write sync status for account %s: %s", account.get("id"), e)
+
+
+def load_attempts(user_id) -> dict:
+    try:
+        rows = _sb_get("user_kv", {"user_id": f"eq.{user_id}", "key": f"eq.{ATTEMPTS_KEY}", "select": "value"})
+        v = rows[0]["value"] if rows else {}
+        v = json.loads(v) if isinstance(v, str) else v
+        return {k: int(n) for k, n in (v or {}).items()}
+    except (requests.RequestException, ValueError, KeyError, TypeError, AttributeError) as e:
+        log.warning("could not read %s for user %s (%s) -- treating as none", ATTEMPTS_KEY, user_id, e)
+        return {}
+
+
+def save_attempts(user_id, attempts: dict):
+    try:
+        resp = requests.post(
+            f"{SUPABASE_URL}/rest/v1/user_kv", params={"on_conflict": "user_id,key"},
+            json=[{"user_id": user_id, "key": ATTEMPTS_KEY, "value": json.dumps(attempts)}],
+            headers={**_sb_headers(), "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        log.warning("could not save %s for user %s: %s", ATTEMPTS_KEY, user_id, e)
+
+
+def trade_id_of(trade: dict) -> str:
+    """Same id publish.py gives the trade: SYMBOL-YYYYMMDD-HHMMSS (entry)."""
+    return f"{trade.get('Symbol')}-{(trade.get('Trade Date') or '').replace('-', '')}-{(trade.get('Entry Time') or '').replace(':', '')}"
 
 
 # ---------------------------------------------------------------------------
@@ -689,6 +781,10 @@ def process_trade(trade: dict) -> dict:
 # Per-account + whole-run orchestration
 # ---------------------------------------------------------------------------
 
+class SkipAccount(Exception):
+    """Not an error: this account is deliberately not published (e.g. wrong IBKR login)."""
+
+
 def process_account(account: dict) -> list[dict]:
     """Flex request -> parse -> FIFO match -> per-trade chart/verdict, for
     one broker account. Returns the list of fully-enriched closed trades
@@ -699,7 +795,36 @@ def process_account(account: dict) -> list[dict]:
     ignored: list = []
     closed_trades = fifo_match_and_merge(raw_executions, account=account, skipped=ignored, fees=parse_flex_fees(flex_doc))
 
+    # The statement's own account must match the one the user said this token belongs to.
+    ref = (account.get("ibkr_account_ref") or "").strip().upper()
+    stmts = ((flex_doc.get("FlexQueryResponse") or {}).get("FlexStatements") or {}).get("FlexStatement") or []
+    stmts = stmts if isinstance(stmts, list) else [stmts]
+    stmt_ids = {str(st.get("accountId") or "").upper() for st in stmts if isinstance(st, dict)} - {""}
+    if ref and stmt_ids and ref not in stmt_ids:
+        raise SkipAccount(f"statement is for {', '.join(sorted(stmt_ids))}, not {ref}")
+
     log.info("account %s: %d executions -> %d closed trades", account.get("id"), len(raw_executions), len(closed_trades))
+    # Skip trades already saved: no chart, no Polygon, no Gemini for them. This is what makes an
+    # hourly run cheap -- a run with nothing new costs one IBKR request.
+    try:
+        have = existing_trade_ids(account.get("user_id"))
+    except requests.RequestException as e:
+        log.warning("account %s: could not read existing trades (%s) -- processing everything", account.get("id"), e)
+        have = set()
+    fresh = [t for t in closed_trades if trade_id_of(t) not in have]
+    log.info("account %s: %d already saved, %d new", account.get("id"), len(closed_trades) - len(fresh), len(fresh))
+
+    # Cost guards: (1) a trade that already failed to chart MAX_CHART_ATTEMPTS times is saved bare
+    # without calling Polygon/Gemini again; (2) at most MAX_NEW_TRADES_PER_RUN get the full treatment.
+    attempts = load_attempts(account.get("user_id"))
+    attempts_before = dict(attempts)
+    give_up = [t for t in fresh if attempts.get(trade_id_of(t), 0) >= MAX_CHART_ATTEMPTS]
+    todo = [t for t in fresh if t not in give_up]
+    account["_deferred"] = max(0, len(todo) - MAX_NEW_TRADES_PER_RUN)
+    account["_bare"] = len(give_up)
+    closed_trades = todo[:MAX_NEW_TRADES_PER_RUN]
+    if account["_deferred"]:
+        log.info("account %s: %d more new trades wait for the next run (cap %d)", account.get("id"), account["_deferred"], MAX_NEW_TRADES_PER_RUN)
     for ig in ignored:
         log.info("account %s: ignored %s %s: %s", account.get("id"), ig.get("symbol"), ig.get("date"), ig.get("reason"))
 
@@ -708,8 +833,12 @@ def process_account(account: dict) -> list[dict]:
         if i > 0:
             time.sleep(CHART_PACING_SECONDS)
         try:
-            enriched.append(process_trade(trade))
+            done = process_trade(trade)
+            if not (done.get("_final_indicators") and done.get("_final_bars")):
+                attempts[trade_id_of(trade)] = attempts.get(trade_id_of(trade), 0) + 1
+            enriched.append(done)
         except Exception as e:
+            attempts[trade_id_of(trade)] = attempts.get(trade_id_of(trade), 0) + 1
             # process_trade already degrades gracefully internally; this is
             # a last-resort catch so one bad trade can't drop the rest of
             # the account's run.
@@ -718,6 +847,14 @@ def process_account(account: dict) -> list[dict]:
             trade["_final_bars"] = None
             trade["_final_image_base64"] = None
             enriched.append(trade)
+    for t in give_up:
+        t["_bare"] = True
+        t["_final_indicators"], t["_final_bars"], t["_final_image_base64"] = {}, [], None
+        t["_chart_error"] = f"no chart after {MAX_CHART_ATTEMPTS} attempts -- saved without chart/verdict"
+        enriched.append(t)
+    attempts = {k: n for k, n in attempts.items() if k not in have}   # forget trades that are saved now
+    if attempts != attempts_before:
+        save_attempts(account.get("user_id"), attempts)
     return enriched
 
 
@@ -730,11 +867,19 @@ def run_daily_sync() -> dict:
     error: str|null}, ...]}."""
     accounts = get_broker_accounts()
     results = []
-    for account in accounts:
+    for n, account in enumerate(accounts):
+        if n > 0:
+            time.sleep(ACCOUNT_PAUSE_SECONDS)  # IBKR throttles Flex requests per token
         try:
             trades = process_account(account)
+        except SkipAccount as e:
+            log.warning("account %s skipped: %s", account.get("id"), e)
+            report_status(account, "skipped", str(e))
+            results.append({"account_id": account.get("id"), "trades": [], "publish_results": [], "error": None, "skipped": str(e)})
+            continue
         except Exception as e:
             log.error("account %s failed entirely: %s", account.get("id"), e)
+            report_status(account, "failed", str(e))
             results.append({"account_id": account.get("id"), "trades": [], "publish_results": [], "error": str(e)})
             continue
 
@@ -748,8 +893,18 @@ def run_daily_sync() -> dict:
                 "account %s: publish done -- %d published, %d failed, %d skipped",
                 account.get("id"), published, failed, skipped,
             )
+            if failed:
+                report_status(account, "failed", f"{published} saved, {failed} failed to save")
+            else:
+                msg = f"{published} new trade(s)" if published else "No new trades"
+                if account.get("_deferred"):
+                    msg += f", {account['_deferred']} more waiting for the next run"
+                if account.get("_bare"):
+                    msg += f", {account['_bare']} saved without a chart"
+                report_status(account, "ok", msg)
         except Exception as e:
             log.error("account %s: publish step failed entirely: %s", account.get("id"), e)
+            report_status(account, "failed", f"saving failed: {e}")
 
         results.append({"account_id": account.get("id"), "trades": trades, "publish_results": publish_results, "error": None})
     return {"accounts": results, "run_at": datetime.utcnow().isoformat() + "Z"}

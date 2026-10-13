@@ -59,12 +59,13 @@ replaced, but there's no n8n in the loop anymore.
   columns exist (frontend repo: `sql/003`-`005`).
 
 **Daily sync** (`daily_sync.py` + `publish.py`)
-- `POST /daily-sync` — for each connected broker account: pull the IBKR
+- `POST /daily-sync` — for each active account that has its own Flex token + query ID in `account_flex` (falls back to the old
+  `broker_accounts` row for users with none), writing `last_sync_*` back for the Accounts page: pull the IBKR
   Flex report, FIFO-match fills, generate chart + AI verdict per trade,
   publish to Supabase (`trades` + `trade_details`, recomputing
   `equity_after` across the account's full history, not just the new
-  batch). Triggered daily by GitHub Actions (`daily-sync.yml`, 18:00 UTC
-  = 20:00 Cairo) — the workflow just POSTs and returns; this also doubles
+  batch). Triggered by GitHub Actions (`daily-sync.yml`: every 2 hours 13:05-21:05 UTC on weekdays plus 22:30 UTC after the close;
+  trades already saved are skipped before any chart/AI work, so a run with nothing new costs one IBKR request per account. Cost guards: max `SYNC_MAX_NEW_TRADES_PER_RUN` (15) new trades per account per run; a trade that fails to chart `SYNC_MAX_CHART_ATTEMPTS` (2) times is saved without chart/verdict. Failed-attempt counts live in `user_kv` key `sync_attempts`) — the workflow just POSTs and returns; this also doubles
   as a wake-up ping for Render's free tier. Can also be triggered manually
   from the Actions tab (`workflow_dispatch`).
 
