@@ -110,13 +110,17 @@ SEND_RETRY_MAX_TRIES = 5
 # separately paced since it follows right after the same trade's Gemini call.
 CHART_PACING_SECONDS = 13
 ACCOUNT_PAUSE_SECONDS = 5   # between accounts: IBKR throttles Flex requests
-# Cost guards. A trade whose chart can't be built is retried on later runs, but only this many
-# times; after that it is saved bare (trade row, no chart/verdict) and never retried by the sync.
-MAX_CHART_ATTEMPTS = int(os.environ.get("SYNC_MAX_CHART_ATTEMPTS", "2"))
+# Cost guards. A trade is NEVER saved without its chart. One whose chart can't be built is not
+# saved; it is retried on every run for the first FAST_RETRIES failures, then at most once per
+# RETRY_COOLDOWN_HOURS (so a symbol Polygon has no data for doesn't burn API calls every run, but
+# a temporary outage still heals on its own).
+FAST_RETRIES = int(os.environ.get("SYNC_FAST_RETRIES", "2"))
+RETRY_COOLDOWN_HOURS = float(os.environ.get("SYNC_RETRY_COOLDOWN_HOURS", "20"))
 # At most this many NEW trades get a chart + AI verdict per account per run; the rest wait for
 # the next run (they are not saved yet, so they are picked up again automatically).
 MAX_NEW_TRADES_PER_RUN = int(os.environ.get("SYNC_MAX_NEW_TRADES_PER_RUN", "15"))
-ATTEMPTS_KEY = "sync_attempts"   # user_kv: {trade_id: failed chart attempts}
+ATTEMPTS_KEY = "sync_attempts"   # user_kv: {trade_id: {"n": failed chart attempts, "last": ISO time of the latest, "err": why}}
+REPORT_KEY = "sync_report"       # user_kv: {"accounts": {account_id: {at, open_positions, no_chart, skipped, deferred}}} -- shown on the Accounts page
 GEMINI_TIMEOUT_S = 30  # matches Vision LLM Analysis's node timeout
 
 DAILY_SYNC_RUNS_DIR = Path(os.environ.get("DAILY_SYNC_RUNS_DIR", "daily_sync_runs"))
@@ -152,6 +156,21 @@ def _sb_get(table: str, params: dict) -> list[dict]:
     resp = requests.get(f"{SUPABASE_URL}/rest/v1/{table}", params=params, headers=_sb_headers(), timeout=30)
     resp.raise_for_status()
     return resp.json()
+
+
+def _sb_get_all(table: str, params: dict, page: int = 1000) -> list[dict]:
+    """Every row, not just the first page: Supabase caps one response at 1000 rows, and a silently
+    truncated list here would make old trades look new (and re-run the AI on them)."""
+    rows, start = [], 0
+    while True:
+        resp = requests.get(f"{SUPABASE_URL}/rest/v1/{table}", params=params,
+                            headers={**_sb_headers(), "Range-Unit": "items", "Range": f"{start}-{start + page - 1}"}, timeout=30)
+        resp.raise_for_status()
+        chunk = resp.json()
+        rows.extend(chunk)
+        if len(chunk) < page:
+            return rows
+        start += page
 
 
 def get_broker_accounts() -> list[dict]:
@@ -193,8 +212,8 @@ def get_broker_accounts() -> list[dict]:
 def existing_trade_ids(user_id) -> set:
     """Trade ids this user already has saved WITH their detail row (a trade whose detail
     failed to save last time is retried)."""
-    ids = {r["id"] for r in _sb_get("trades", {"user_id": f"eq.{user_id}", "select": "id"})}
-    have_detail = {r["trade_id"] for r in _sb_get("trade_details", {"user_id": f"eq.{user_id}", "select": "trade_id"})}
+    ids = {r["id"] for r in _sb_get_all("trades", {"user_id": f"eq.{user_id}", "select": "id", "order": "id.asc"})}
+    have_detail = {r["trade_id"] for r in _sb_get_all("trade_details", {"user_id": f"eq.{user_id}", "select": "trade_id", "order": "trade_id.asc"})}
     return ids & have_detail
 
 
@@ -220,7 +239,7 @@ def load_attempts(user_id) -> dict:
         rows = _sb_get("user_kv", {"user_id": f"eq.{user_id}", "key": f"eq.{ATTEMPTS_KEY}", "select": "value"})
         v = rows[0]["value"] if rows else {}
         v = json.loads(v) if isinstance(v, str) else v
-        return {k: int(n) for k, n in (v or {}).items()}
+        return {k: (n if isinstance(n, dict) else {"n": int(n), "last": None}) for k, n in (v or {}).items()}
     except (requests.RequestException, ValueError, KeyError, TypeError, AttributeError) as e:
         log.warning("could not read %s for user %s (%s) -- treating as none", ATTEMPTS_KEY, user_id, e)
         return {}
@@ -237,6 +256,75 @@ def save_attempts(user_id, attempts: dict):
         resp.raise_for_status()
     except requests.RequestException as e:
         log.warning("could not save %s for user %s: %s", ATTEMPTS_KEY, user_id, e)
+
+
+def retry_due(entry: dict | None) -> bool:
+    if not entry or int(entry.get("n", 0)) < FAST_RETRIES or not entry.get("last"):
+        return True
+    try:
+        last = datetime.fromisoformat(str(entry["last"]).replace("Z", ""))
+    except ValueError:
+        return True
+    return (datetime.utcnow() - last).total_seconds() >= RETRY_COOLDOWN_HOURS * 3600
+
+
+def next_retry_of(entry: dict | None):
+    """When this stuck trade will be tried again: None = on the very next run, else an ISO time
+    (the end of its cooldown)."""
+    if not entry or int(entry.get("n", 0)) < FAST_RETRIES or not entry.get("last"):
+        return None
+    try:
+        last = datetime.fromisoformat(str(entry["last"]).replace("Z", ""))
+    except ValueError:
+        return None
+    from datetime import timedelta
+    return (last + timedelta(hours=RETRY_COOLDOWN_HOURS)).isoformat() + "Z"
+
+
+def load_report(user_id) -> dict:
+    try:
+        rows = _sb_get("user_kv", {"user_id": f"eq.{user_id}", "key": f"eq.{REPORT_KEY}", "select": "value"})
+        v = rows[0]["value"] if rows else {}
+        v = json.loads(v) if isinstance(v, str) else v
+        return v if isinstance(v, dict) and isinstance(v.get("accounts"), dict) else {"accounts": {}}
+    except (requests.RequestException, ValueError, KeyError, TypeError, AttributeError) as e:
+        log.warning("could not read %s for user %s (%s) -- starting fresh", REPORT_KEY, user_id, e)
+        return {"accounts": {}}
+
+
+def save_account_report(account: dict, report: dict):
+    """Store this account's sync details in user_kv under `sync_report` (keyed by account id, so one
+    user's accounts share the one row). Best effort: a failure here never breaks the sync."""
+    user_id, aid = account.get("user_id"), account.get("account_id")
+    if not user_id or not aid:
+        return   # legacy single-token row: the Accounts page has no account to show it on
+    try:
+        whole = load_report(user_id)
+        whole["accounts"][str(aid)] = report
+        resp = requests.post(
+            f"{SUPABASE_URL}/rest/v1/user_kv", params={"on_conflict": "user_id,key"},
+            json=[{"user_id": user_id, "key": REPORT_KEY, "value": json.dumps(whole)}],
+            headers={**_sb_headers(), "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        log.warning("could not save %s for account %s: %s", REPORT_KEY, aid, e)
+
+
+def build_report(account: dict, publish_results: list[dict]) -> dict:
+    """Everything the sync saw but did NOT turn into a saved trade, for the Accounts page."""
+    skipped = [dict(ig) for ig in (account.get("_ignored") or [])]
+    for r in publish_results:
+        if r.get("status") == "failed":
+            skipped.append({"symbol": str(r.get("id") or "").split("-")[0], "reason": f"could not be saved: {r.get('reason') or 'unknown error'}"})
+    return {
+        "at": datetime.utcnow().isoformat() + "Z",
+        "open_positions": account.get("_open") or [],
+        "no_chart": account.get("_stuck") or [],
+        "skipped": skipped,
+        "deferred": int(account.get("_deferred") or 0),
+    }
 
 
 def trade_id_of(trade: dict) -> str:
@@ -785,6 +873,22 @@ class SkipAccount(Exception):
     """Not an error: this account is deliberately not published (e.g. wrong IBKR login)."""
 
 
+def _note_failure(attempts: dict, trade: dict, reason: str | None = None):
+    e = attempts.get(trade_id_of(trade)) or {"n": 0, "last": None}
+    attempts[trade_id_of(trade)] = {
+        "n": int(e.get("n", 0)) + 1, "last": datetime.utcnow().isoformat() + "Z",
+        "err": (reason or e.get("err") or "")[:250],
+    }
+
+
+def _stuck_entry(trade: dict, entry: dict | None) -> dict:
+    return {
+        "symbol": trade.get("Symbol"), "date": trade.get("Trade Date"), "id": trade_id_of(trade),
+        "reason": (entry or {}).get("err") or "chart data unavailable for this symbol/date",
+        "attempts": int((entry or {}).get("n", 0)), "next_retry": next_retry_of(entry),
+    }
+
+
 def process_account(account: dict) -> list[dict]:
     """Flex request -> parse -> FIFO match -> per-trade chart/verdict, for
     one broker account. Returns the list of fully-enriched closed trades
@@ -793,7 +897,10 @@ def process_account(account: dict) -> list[dict]:
     flex_doc = request_flex_statement(account)
     raw_executions = parse_flex_executions(flex_doc)
     ignored: list = []
-    closed_trades = fifo_match_and_merge(raw_executions, account=account, skipped=ignored, fees=parse_flex_fees(flex_doc))
+    open_positions: list = []
+    closed_trades = fifo_match_and_merge(raw_executions, account=account, skipped=ignored, fees=parse_flex_fees(flex_doc),
+                                         open_positions=open_positions)
+    account["_ignored"], account["_open"], account["_stuck"] = ignored, open_positions, []
 
     # The statement's own account must match the one the user said this token belongs to.
     ref = (account.get("ibkr_account_ref") or "").strip().upper()
@@ -814,14 +921,16 @@ def process_account(account: dict) -> list[dict]:
     fresh = [t for t in closed_trades if trade_id_of(t) not in have]
     log.info("account %s: %d already saved, %d new", account.get("id"), len(closed_trades) - len(fresh), len(fresh))
 
-    # Cost guards: (1) a trade that already failed to chart MAX_CHART_ATTEMPTS times is saved bare
-    # without calling Polygon/Gemini again; (2) at most MAX_NEW_TRADES_PER_RUN get the full treatment.
+    # Cost guards: (1) a trade that keeps failing to chart is retried at most once per
+    # RETRY_COOLDOWN_HOURS after FAST_RETRIES failures (it is never saved without a chart);
+    # (2) at most MAX_NEW_TRADES_PER_RUN get the full treatment per run.
     attempts = load_attempts(account.get("user_id"))
-    attempts_before = dict(attempts)
-    give_up = [t for t in fresh if attempts.get(trade_id_of(t), 0) >= MAX_CHART_ATTEMPTS]
-    todo = [t for t in fresh if t not in give_up]
+    attempts_before = json.loads(json.dumps(attempts))
+    waiting = [t for t in fresh if not retry_due(attempts.get(trade_id_of(t)))]
+    todo = [t for t in fresh if t not in waiting]
     account["_deferred"] = max(0, len(todo) - MAX_NEW_TRADES_PER_RUN)
-    account["_bare"] = len(give_up)
+    account["_cooling"] = [t.get("Symbol") for t in waiting]
+    account["_stuck"].extend(_stuck_entry(t, attempts.get(trade_id_of(t))) for t in waiting)
     closed_trades = todo[:MAX_NEW_TRADES_PER_RUN]
     if account["_deferred"]:
         log.info("account %s: %d more new trades wait for the next run (cap %d)", account.get("id"), account["_deferred"], MAX_NEW_TRADES_PER_RUN)
@@ -835,10 +944,16 @@ def process_account(account: dict) -> list[dict]:
         try:
             done = process_trade(trade)
             if not (done.get("_final_indicators") and done.get("_final_bars")):
-                attempts[trade_id_of(trade)] = attempts.get(trade_id_of(trade), 0) + 1
+                _note_failure(attempts, trade, done.get("_chart_error"))
+                account.setdefault("_failed", []).append(trade.get("Symbol"))
+                account["_stuck"].append(_stuck_entry(trade, attempts.get(trade_id_of(trade))))
+            else:
+                attempts.pop(trade_id_of(trade), None)   # charted fine: forget earlier failures
             enriched.append(done)
         except Exception as e:
-            attempts[trade_id_of(trade)] = attempts.get(trade_id_of(trade), 0) + 1
+            _note_failure(attempts, trade, f"{type(e).__name__}: {e}")
+            account.setdefault("_failed", []).append(trade.get("Symbol"))
+            account["_stuck"].append(_stuck_entry(trade, attempts.get(trade_id_of(trade))))
             # process_trade already degrades gracefully internally; this is
             # a last-resort catch so one bad trade can't drop the rest of
             # the account's run.
@@ -847,11 +962,6 @@ def process_account(account: dict) -> list[dict]:
             trade["_final_bars"] = None
             trade["_final_image_base64"] = None
             enriched.append(trade)
-    for t in give_up:
-        t["_bare"] = True
-        t["_final_indicators"], t["_final_bars"], t["_final_image_base64"] = {}, [], None
-        t["_chart_error"] = f"no chart after {MAX_CHART_ATTEMPTS} attempts -- saved without chart/verdict"
-        enriched.append(t)
     attempts = {k: n for k, n in attempts.items() if k not in have}   # forget trades that are saved now
     if attempts != attempts_before:
         save_attempts(account.get("user_id"), attempts)
@@ -899,9 +1009,11 @@ def run_daily_sync() -> dict:
                 msg = f"{published} new trade(s)" if published else "No new trades"
                 if account.get("_deferred"):
                     msg += f", {account['_deferred']} more waiting for the next run"
-                if account.get("_bare"):
-                    msg += f", {account['_bare']} saved without a chart"
+                stuck = (account.get("_failed") or []) + (account.get("_cooling") or [])
+                if stuck:
+                    msg += f", no chart yet for {', '.join(sorted(set(map(str, stuck))))} (will retry, not saved without it)"
                 report_status(account, "ok", msg)
+            save_account_report(account, build_report(account, publish_results))
         except Exception as e:
             log.error("account %s: publish step failed entirely: %s", account.get("id"), e)
             report_status(account, "failed", f"saving failed: {e}")

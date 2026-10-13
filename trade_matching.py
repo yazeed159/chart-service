@@ -277,7 +277,8 @@ def _sign(x: float) -> int:
 
 
 def fifo_match_and_merge(raw_trades: list[dict], account: Optional[dict] = None,
-                         skipped: Optional[list] = None, fees: Optional[list] = None) -> list[dict]:
+                         skipped: Optional[list] = None, fees: Optional[list] = None,
+                         open_positions: Optional[list] = None) -> list[dict]:
     """Shared FIFO-matching + same-order-fill-merging logic for both the
     CSV import path and the (future) daily Flex path.
 
@@ -292,6 +293,11 @@ def fifo_match_and_merge(raw_trades: list[dict], account: Optional[dict] = None,
     skipped: optional list; when given, every piece of data that was IGNORED
     because the file doesn't hold the whole position gets appended to it
     (see "orphan closes" below) so callers can tell the user what was dropped.
+
+    open_positions: optional list; when given, every position that is still OPEN at the end
+    of the file (opening fills nothing has closed yet) is appended as
+    {symbol, side, qty, avg_price, entry_time, date}. They are never saved as trades; the
+    daily sync reports them so an open position is visible until it closes.
 
     Orphan closes: a fill the broker flags as closing-only (Open/CloseIndicator
     "C") that has nothing to close in THIS file -- the position was opened in an
@@ -408,6 +414,19 @@ def fifo_match_and_merge(raw_trades: list[dict], account: Optional[dict] = None,
                 })
             elif matched_any and not queue:
                 cycle += 1  # exactly flat: next execution starts a new position
+        if open_positions is not None and queue:
+            # Whatever is left in the queue was opened and never closed in this file.
+            total = sum(abs(l["qty"]) for l in queue)
+            if total:
+                first_dt = min(l["dateTime"] for l in queue)
+                open_positions.append({
+                    "symbol": sym,
+                    "side": "Long" if queue[0]["qty"] > 0 else "Short",
+                    "qty": total,
+                    "avg_price": round(sum(l["price"] * abs(l["qty"]) for l in queue) / total, 4),
+                    "entry_time": format_time(first_dt),
+                    "date": format_date(first_dt),
+                })
 
     # Merge matches that belong to the same trade (same symbol + entry
     # date + entry time) -- two raw matches sharing that key are fills of

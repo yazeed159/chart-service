@@ -127,3 +127,17 @@ def test_fee_on_a_shared_order_is_split_by_shares_and_a_header_only_section_is_h
     assert fee_rows == [] and len(rows) == 2
     t = tm.fifo_match_and_merge(tm.parse_csv_executions(rows), fees=tm.parse_csv_fees(fee_rows))[0]
     assert t["Fees"] == 0.0
+
+
+def test_unclosed_position_is_reported_as_open_and_not_saved_as_a_trade():
+    opn = []
+    trades = tm.fifo_match_and_merge([
+        mk("AAA", "093000", 100, 5, 1, "O"), mk("AAA", "094000", -100, 6, 1, "C"),
+        mk("BBB", "100000", 50, 10, 1, "O"), mk("BBB", "100500", 25, 11, 1, "O"),
+        mk("DDD", "111000", -40, 8, 1, "O"),
+    ], open_positions=opn)
+    assert [t["Symbol"] for t in trades] == ["AAA"]
+    by = {p["symbol"]: p for p in opn}
+    assert set(by) == {"BBB", "DDD"}
+    assert by["BBB"]["side"] == "Long" and by["BBB"]["qty"] == 75 and by["BBB"]["entry_time"] == "10:00:00"
+    assert by["DDD"]["side"] == "Short" and by["DDD"]["qty"] == 40

@@ -111,9 +111,7 @@ def prepare_trade_payload(trade: dict) -> dict:
     broker_account_id = trade.get("_broker_account_id")
     account_id = trade.get("_account_id")
 
-    if trade.get("_bare"):   # gave up charting (see daily_sync.MAX_CHART_ATTEMPTS): save the trade without chart data
-        indicators, bars = indicators or {}, bars or []
-    elif not indicators or not bars:
+    if not indicators or not bars:
         return {
             "_skip": True, "status": "skipped", "id": trade_id,
             "symbol": trade.get("Symbol"), "trade_date": trade_date,
@@ -236,13 +234,21 @@ def _publish_trade_detail(payload: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 def _get_user_trades(user_id) -> list[dict]:
-    resp = requests.get(
-        f"{SUPABASE_URL}/rest/v1/trades",
-        params={"user_id": f"eq.{user_id}", "select": "*", "order": "trade_date.asc,entry_time.asc"},
-        headers=_supabase_headers(), timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    # Paged: one response is capped at 1000 rows, and the equity_after recompute below needs the
+    # user's WHOLE history -- a truncated list would write wrong running balances.
+    rows, start, page = [], 0, 1000
+    while True:
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/trades",
+            params={"user_id": f"eq.{user_id}", "select": "*", "order": "trade_date.asc,entry_time.asc,id.asc"},
+            headers={**_supabase_headers(), "Range-Unit": "items", "Range": f"{start}-{start + page - 1}"}, timeout=30,
+        )
+        resp.raise_for_status()
+        chunk = resp.json()
+        rows.extend(chunk)
+        if len(chunk) < page:
+            return rows
+        start += page
 
 
 def default_live_account_id(user_id):
