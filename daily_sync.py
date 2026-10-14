@@ -76,6 +76,7 @@ from pathlib import Path
 import requests
 from flask import Blueprint, jsonify
 
+import xml.etree.ElementTree as ET
 from flex_xml import parse_flex_xml
 from trade_matching import fifo_match_and_merge, parse_flex_executions, parse_flex_fees
 from publish import publish_trades
@@ -357,6 +358,19 @@ def trade_id_of(trade: dict) -> str:
 # Flex request + wait/retry poll
 # ---------------------------------------------------------------------------
 
+def _parse_or_explain(resp) -> dict:
+    """parse_flex_xml, but if IBKR (or something in front of it) sent back a
+    non-XML body, say what it actually was instead of a bare expat error."""
+    try:
+        return parse_flex_xml(resp.content)
+    except ET.ParseError as e:
+        snippet = resp.text[:200].replace("\n", " ").strip()
+        raise RuntimeError(
+            f"IBKR returned non-XML (HTTP {resp.status_code}, "
+            f"{resp.headers.get('Content-Type', 'no content-type')}): {snippet!r} [{e}]"
+        ) from e
+
+
 def _send_flex_request(token: str, query_id: str) -> dict:
     resp = requests.get(
         FLEX_SEND_URL,
@@ -365,7 +379,7 @@ def _send_flex_request(token: str, query_id: str) -> dict:
         timeout=30,
     )
     resp.raise_for_status()
-    return parse_flex_xml(resp.content)
+    return _parse_or_explain(resp)
 
 
 def _get_statement(token: str, reference_code: str) -> dict:
@@ -376,7 +390,7 @@ def _get_statement(token: str, reference_code: str) -> dict:
         timeout=30,
     )
     resp.raise_for_status()
-    return parse_flex_xml(resp.content)
+    return _parse_or_explain(resp)
 
 
 def request_flex_statement(account: dict) -> dict:
