@@ -154,11 +154,20 @@ def fetch_float_bulk_start():
         log.warning("list_trades_missing_float failed for user %s: %s", user_id, e)
         return jsonify({"error": f"Couldn't look up trades: {e}"}), 502
 
+    # The journal sends the ids of the trades in the account(s)/period the user has selected, so
+    # only those are filled. A body without "trade_ids" keeps the old everything-the-user-owns
+    # behaviour; an empty list means nothing is selected, so nothing is filled.
+    body = request.get_json(silent=True) or {}
+    scope_ids = body.get("trade_ids")
+    scope = {str(t) for t in scope_ids} if isinstance(scope_ids, list) else None
+
     symbol_to_trade_ids: dict = {}
     for row in missing:
         symbol = (row.get("symbol") or "").strip().upper()
         trade_id = row.get("id")
         if not symbol or not trade_id:
+            continue
+        if scope is not None and str(trade_id) not in scope:
             continue
         symbol_to_trade_ids.setdefault(symbol, []).append(trade_id)
 
