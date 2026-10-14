@@ -78,7 +78,8 @@ from flask import Blueprint, jsonify
 
 import xml.etree.ElementTree as ET
 from flex_xml import parse_flex_xml
-from trade_matching import fifo_match_and_merge, parse_flex_executions, parse_flex_fees
+from trade_matching import (fifo_match_and_merge, parse_flex_executions, parse_flex_fees,
+                            parse_csv_executions, parse_csv_fees, read_csv_sections)
 from publish import publish_trades
 import symbol_info_store
 
@@ -390,6 +391,11 @@ def _get_statement(token: str, reference_code: str) -> dict:
         timeout=30,
     )
     resp.raise_for_status()
+    # IBKR sends the statement in whatever Delivery Format the Flex Query is set to. XML is parsed
+    # as before; CSV (anything not starting with '<') is passed along as raw text and handled by
+    # the CSV parsers in trade_matching.py. "Not ready yet" replies are always XML.
+    if not resp.text.lstrip("\ufeff \t\r\n").startswith("<"):
+        return {"FlexCsv": resp.text.lstrip("\ufeff")}
     return _parse_or_explain(resp)
 
 
@@ -435,7 +441,7 @@ def request_flex_statement(account: dict) -> dict:
 
     for attempt in range(1, STATEMENT_POLL_MAX_TRIES + 1):
         stmt_doc = _get_statement(token, reference_code)
-        if stmt_doc.get("FlexQueryResponse"):
+        if stmt_doc.get("FlexQueryResponse") or stmt_doc.get("FlexCsv"):
             return stmt_doc
         log.info(
             "Flex statement not ready yet for account %s (attempt %d/%d)",
@@ -924,25 +930,50 @@ def _stuck_entry(trade: dict, entry: dict | None) -> dict:
     }
 
 
+def _csv_rows_with_datetime(rows: list[dict]) -> list[dict]:
+    """IBKR CSVs may have separate TradeDate / TradeTime columns instead of one DateTime."""
+    out = []
+    for r in rows:
+        low = {str(k).strip().lower().replace("_", "").replace(" ", ""): k for k in r}
+        if "datetime" not in low and "tradedate" in low and "tradetime" in low:
+            r = {**r, "DateTime": f"{r[low['tradedate']]};{r[low['tradetime']]}"}
+        out.append(r)
+    return out
+
+
+def executions_from_statement(flex_doc: dict):
+    """(raw_executions, fees, account_ids) from either a Flex XML or a Flex CSV statement."""
+    if "FlexCsv" in flex_doc:
+        trade_rows, fee_rows = read_csv_sections(flex_doc["FlexCsv"])
+        trade_rows = _csv_rows_with_datetime(trade_rows)
+        ids = set()
+        for r in trade_rows:
+            for k, v in r.items():
+                if str(k).strip().lower() == "clientaccountid" and v:
+                    ids.add(str(v).strip().upper())
+        return parse_csv_executions(trade_rows), parse_csv_fees(fee_rows), ids
+    stmts = ((flex_doc.get("FlexQueryResponse") or {}).get("FlexStatements") or {}).get("FlexStatement") or []
+    stmts = stmts if isinstance(stmts, list) else [stmts]
+    ids = {str(st.get("accountId") or "").upper() for st in stmts if isinstance(st, dict)} - {""}
+    return parse_flex_executions(flex_doc), parse_flex_fees(flex_doc), ids
+
+
 def process_account(account: dict) -> list[dict]:
     """Flex request -> parse -> FIFO match -> per-trade chart/verdict, for
     one broker account. Returns the list of fully-enriched closed trades
     (backtest-import never reaches this path, so no _import_source filter
     is needed here)."""
     flex_doc = request_flex_statement(account)
-    raw_executions = parse_flex_executions(flex_doc)
+    raw_executions, fees, stmt_ids = executions_from_statement(flex_doc)
     ignored: list = []
     open_positions: list = []
-    closed_trades = fifo_match_and_merge(raw_executions, account=account, skipped=ignored, fees=parse_flex_fees(flex_doc),
+    closed_trades = fifo_match_and_merge(raw_executions, account=account, skipped=ignored, fees=fees,
                                          open_positions=open_positions)
     account["_ignored"], account["_open"], account["_stuck"] = ignored, open_positions, []
     account["_statement"] = statement_info(flex_doc, raw_executions, len(closed_trades))
 
     # The statement's own account must match the one the user said this token belongs to.
     ref = (account.get("ibkr_account_ref") or "").strip().upper()
-    stmts = ((flex_doc.get("FlexQueryResponse") or {}).get("FlexStatements") or {}).get("FlexStatement") or []
-    stmts = stmts if isinstance(stmts, list) else [stmts]
-    stmt_ids = {str(st.get("accountId") or "").upper() for st in stmts if isinstance(st, dict)} - {""}
     if ref and stmt_ids and ref not in stmt_ids:
         raise SkipAccount(f"statement is for {', '.join(sorted(stmt_ids))}, not {ref}")
 

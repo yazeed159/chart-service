@@ -275,27 +275,40 @@ def import_trades():
     except UnicodeDecodeError:
         return jsonify({"error": "couldn't read the file as UTF-8 text -- is it really a CSV?"}), 400
 
-    rows, fee_rows = read_csv_sections(raw)   # each section (trades, taxes/fees) against its own header
-    if not rows:
-        return jsonify({"error": "CSV had no data rows"}), 400
+    if raw.lstrip().startswith("<"):
+        # An IBKR Flex XML statement instead of a CSV.
+        try:
+            from flex_xml import parse_flex_xml
+            from daily_sync import executions_from_statement  # lazy import, same pattern as elsewhere in this service
+            raw_executions, fee_list, _ids = executions_from_statement(parse_flex_xml(raw))
+        except Exception as e:
+            return jsonify({"error": f"couldn't read this XML as an IBKR Flex statement: {type(e).__name__}: {e}"}), 422
+        if not raw_executions:
+            return jsonify({"error": "the XML statement had no trades (is the Trades / Trade Confirmations section in the Flex Query?)"}), 422
+        rows, skipped = raw_executions, 0
+    else:
+        rows, fee_rows = read_csv_sections(raw)   # each section (trades, taxes/fees) against its own header
+        if not rows:
+            return jsonify({"error": "CSV had no data rows"}), 400
 
-    valid_rows = [r for r in rows if looks_like_csv_row(r)]
-    skipped = len(rows) - len(valid_rows)
-    if not valid_rows:
-        return jsonify({
-            "error": (
-                "no row in this file had a recognizable symbol + date/time + price column. "
-                "Headers found: " + ", ".join(rows[0].keys())
-            )
-        }), 422
+        valid_rows = [r for r in rows if looks_like_csv_row(r)]
+        skipped = len(rows) - len(valid_rows)
+        if not valid_rows:
+            return jsonify({
+                "error": (
+                    "no row in this file had a recognizable symbol + date/time + price column. "
+                    "Headers found: " + ", ".join(rows[0].keys())
+                )
+            }), 422
 
-    raw_executions = parse_csv_executions(valid_rows)
+        raw_executions = parse_csv_executions(valid_rows)
+        fee_list = parse_csv_fees(fee_rows)
     ignored: list = []
     try:
         from publish import resolve_account_id  # lazy import, same pattern as elsewhere in this service
         target_account = resolve_account_id(user_id, (request.form.get("account_id") or "").strip() or None)
         closed_trades = fifo_match_and_merge(raw_executions, account={"user_id": user_id, "account_id": target_account}, skipped=ignored,
-                                             fees=parse_csv_fees(fee_rows))
+                                             fees=fee_list)
     except Exception as e:
         log.error("import-trades: FIFO matching failed: %s", e)
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
@@ -325,7 +338,6 @@ def import_trades():
     th = threading.Thread(target=_run_import_job, args=(job_id, closed_trades, cancel_event, skip_ids), daemon=True)
     th.start()
 
-    fee_list = parse_csv_fees(fee_rows)
     fee_info = {"rows": len(fee_list), "total": round(sum(f["amount"] for f in fee_list), 2),
                 "attached": round(sum(t.get("Fees") or 0 for t in closed_trades), 2)}
     return jsonify({"job_id": job_id, "trades": closed_trades, "skipped_rows": skipped, "fee_info": fee_info,
