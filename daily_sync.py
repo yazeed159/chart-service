@@ -525,7 +525,9 @@ def _indicator_summary(chart: dict | None) -> str:
         f"longer-term trend context only, not part of the dip-buy/breakout criteria below)",
         f"- MACD: {fmt(indicators.get('macd_at_entry'), 4)}, Signal: {fmt(indicators.get('macd_signal_at_entry'), 4)}, "
         f"Histogram: {fmt(indicators.get('macd_hist_at_entry'), 4)} (prior bar: {fmt(indicators.get('macd_hist_prior_bar'), 4)})",
-        f"- Service-computed setup_type guess: {indicators.get('setup_type', 'n/a')}",
+        f"- Setup tag (rule-based from the candles; red_to_green = entry above the high of the prior red 1-min bar, "
+        f"green_over_green_wick = entry above the upper wick of the prior green bar, ema9_dip_buy = bounce off the 9 EMA, chase = right pattern but filled too far above the trigger): "
+        f"{indicators.get('setup_type', 'n/a')}",
         f"- Service-suggested stop/target: ${fmt(indicators.get('stop_price'))} / ${fmt(indicators.get('target_price'))} "
         f"(R multiple: {fmt(indicators.get('r_multiple'), 2)})",
         f"- Display window price range: ${fmt(indicators.get('display_price_low'))} - ${fmt(indicators.get('display_price_high'))}",
@@ -612,7 +614,7 @@ def _build_verdict_prompt(trade: dict, indicator_summary: str, need_symbol_info:
         "with no pullback or breakout level touched\"). Always cite a specific number from the "
         "data above, whether the signal was good or absent.\n\n"
         "Respond with JSON only, no markdown: {\"verdict\": \"good entry|late entry|should have "
-        "avoided\", \"setup_type\": \"breakout|dip_buy|other\", \"reasoning\": string (3-5 "
+        "avoided\", \"setup_type\": \"red_to_green|green_over_green_wick|ema9_dip_buy|chase|other\", \"reasoning\": string (3-5 "
         "sentences covering whether the setup criteria were plausibly met), "
         "\"better_entry_price\": number (never null -- always propose one, see instructions "
         "above), \"better_entry_time\": string (never null), \"better_exit_price\": number "
@@ -875,6 +877,11 @@ def process_trade(trade: dict) -> dict:
         cached_symbol_info = None
     verdict = _get_verdict(trade, summary, cached_symbol_info)
     trade = _apply_verdict(trade, verdict)
+    # The setup tag is the trader's own plan, read straight off the candles
+    # (setups.py) -- not whatever the LLM guessed from breakout/dip_buy/other.
+    rule_setup = ((chart or {}).get("indicators") or {}).get("setup_type")
+    if rule_setup:
+        trade["Setup Type"] = rule_setup
 
     final_chart = None
     final_err = None

@@ -94,6 +94,11 @@ def _normalize_better_time(raw, trade_date, fallback_time) -> str:
     return f"{trade_date}T{hh:02d}:{mm}:{ss}"
 
 
+def _behavior_tags(trade: dict, user_id):
+    from trade_tags import tags_for_new_trade  # lazy: pulls in market_data
+    return tags_for_new_trade(trade, user_id)
+
+
 def prepare_trade_payload(trade: dict) -> dict:
     """Port of 'Prepare Trade Payloads'. Returns either
     {_skip: True, status: 'skipped', id, symbol, trade_date, user_id,
@@ -179,6 +184,9 @@ def prepare_trade_payload(trade: dict) -> dict:
         "rvol_tag": indicators.get("rvol_tag"),
         "float_tag": indicators.get("float_tag"),
         "relative_volume": indicators.get("relative_volume"),
+        # Behavior tags (session, scaled in/out, revenge, VWAP/EMA9, ...) -- trade_tags.py. None when
+        # they couldn't be computed (stored as NULL = "not tagged yet", the Journal backfill fills it).
+        "behavior_tags": _behavior_tags(trade, user_id),
     }
 
     # Only send account_id when we actually have one: before 001_accounts.sql
@@ -321,6 +329,11 @@ def _merge_and_upsert_trades(user_id, confirmed_index_rows: list[dict], err_out:
         for row in confirmed_index_rows:
             row.pop("fees", None)
             row.pop("venues", None)
+
+    # and for the behavior tags (sql/006_behavior_tags.sql)
+    if existing and not any("behavior_tags" in r for r in existing):
+        for row in confirmed_index_rows:
+            row.pop("behavior_tags", None)
 
     default_acct = default_live_account_id(user_id)
     by_id = {row["id"]: row for row in existing}

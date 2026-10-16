@@ -235,6 +235,7 @@ import float_routes
 import backtest_routes
 import strategies_routes
 import misc_routes
+import setup_routes
 
 # ai_routes.py / backtest_import_routes.py / daily_sync.py still do
 # `from chart_service import _build_chart_response` etc. (lazily, inside

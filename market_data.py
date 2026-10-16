@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, date
 
 import requests
 import pandas as pd
+from setups import classify as classify_setup
 
 import float_shares_store
 import alpaca_client
@@ -788,17 +789,21 @@ def compute_trade_levels(full_bars: pd.DataFrame, entry_dt: datetime, entry_pric
 
     breakout = is_long and entry_price >= prior_high * 0.999 and entry_bar_vol >= 1.5 * avg_vol
     dip_buy = is_long and abs(entry_price - vwap_e) / max(entry_price, 1) < 0.006 or (is_long and abs(entry_price - ema9_e) / max(entry_price, 1) < 0.006)
-    setup_type = "breakout" if breakout else ("dip_buy" if dip_buy else "other")
+    # Stop placement below still keys off this older breakout/dip read; the TAG
+    # reported to the journal is the trader's own three setups (setups.py), which
+    # is deterministic from the candles -- never an LLM guess.
+    legacy_setup = "breakout" if breakout else ("dip_buy" if dip_buy else "other")
+    setup_type = classify_setup(full_bars, entry_dt, entry_price, side)
 
     if is_long:
         swing_stop = recent_low - (recent_high - recent_low) * 0.05
-        stop_price = min(swing_stop, vwap_e - 0.01) if setup_type == "dip_buy" else swing_stop
+        stop_price = min(swing_stop, vwap_e - 0.01) if legacy_setup == "dip_buy" else swing_stop
         stop_price = min(stop_price, entry_price - 0.01)
         risk = entry_price - stop_price
         target_price = entry_price + risk * 2
     else:
         swing_stop = recent_high + (recent_high - recent_low) * 0.05
-        stop_price = max(swing_stop, vwap_e + 0.01) if setup_type == "dip_buy" else swing_stop
+        stop_price = max(swing_stop, vwap_e + 0.01) if legacy_setup == "dip_buy" else swing_stop
         stop_price = max(stop_price, entry_price + 0.01)
         risk = stop_price - entry_price
         target_price = entry_price - risk * 2
