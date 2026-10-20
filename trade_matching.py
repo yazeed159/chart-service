@@ -551,7 +551,7 @@ def fifo_match_and_merge(raw_trades: list[dict], account: Optional[dict] = None,
             "Balance After": "",
             "_import_source": source,
             "_user_id": account.get("user_id") if account else None,
-            "_broker_account_id": account.get("id") if account else None,
+            "_broker_account_id": (account.get("broker_account_id", account.get("id")) if account else None),
             "_account_id": account.get("account_id") if account else None,
         })
 

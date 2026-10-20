@@ -202,6 +202,9 @@ def get_broker_accounts() -> list[dict]:
             continue  # archived account, or keys not filled in yet
         out.append({
             "id": a["id"], "account_id": a["id"], "user_id": a.get("user_id") or r.get("user_id"),
+            # trades.broker_account_id is a FK to broker_accounts, NOT accounts: only send the
+            # user's legacy broker_accounts id (or None), never the accounts.id above.
+            "broker_account_id": (legacy_by_user.get(r.get("user_id")) or {}).get("id"),
             "name": a.get("name"), "ibkr_flex_token": r["ibkr_flex_token"],
             "ibkr_flex_query_id": r["ibkr_flex_query_id"], "ibkr_account_ref": r.get("ibkr_account_ref"),
             "telegram_chat_id": (legacy_by_user.get(r.get("user_id")) or {}).get("telegram_chat_id"),
