@@ -48,6 +48,12 @@ POST /import-trades
   Headers: Authorization: Bearer <supabase access token>   (required)
   multipart/form-data, one file field named "trade_csv".
 
+  Optional form fields: account_id, overwrite=1, date_from / date_to (YYYY-MM-DD, inclusive;
+  matching runs on the whole file, only the result is narrowed), preview=1 (match + count only:
+  returns 200 {"preview": true, "trades", "already_imported", "file": {total, first, last}} and
+  starts NO job -- each trade is slimmed to trade_id/Symbol/Trade Date/Entry Time/Side/P&L After Comm;
+  exclude_ids=<JSON list of trade ids> drops hand-picked trades; the browser re-sends the same file without preview to actually import).
+
   -> 202 { "job_id": <str>, "trades": [...matched, not yet charted/
            graded/published], "skipped_rows": <int> }
   -> 400 / 401 / 422 -- see below
@@ -70,6 +76,7 @@ POST /import-trades/<job_id>/cancel
 """
 
 import os
+import re
 import csv
 import io
 import json
@@ -320,7 +327,32 @@ def import_trades():
     for ig in ignored:
         log.info("import-trades: ignored %s %s: %s", ig.get("symbol"), ig.get("date"), ig.get("reason"))
 
+    # Optional date window (inclusive, YYYY-MM-DD). Matching above ran over the WHOLE file so
+    # FIFO pairing is right at the edges; only the result is narrowed here.
+    date_from = (request.form.get("date_from") or "").strip()
+    date_to = (request.form.get("date_to") or "").strip()
+    for label, v in (("date_from", date_from), ("date_to", date_to)):
+        if v and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
+            return jsonify({"error": f"{label} must look like YYYY-MM-DD"}), 400
+    all_dates = sorted(d for d in ((t.get("Trade Date") or "")[:10] for t in closed_trades) if d)
+    file_summary = {"total": len(closed_trades), "first": all_dates[0] if all_dates else None, "last": all_dates[-1] if all_dates else None}
+    if date_from or date_to:
+        closed_trades = [t for t in closed_trades
+                         if (not date_from or (t.get("Trade Date") or "")[:10] >= date_from)
+                         and (not date_to or (t.get("Trade Date") or "")[:10] <= date_to)]
+    # Optional hand-picked exclusions: JSON list of trade ids to leave out (applied after the window).
+    raw_excl = (request.form.get("exclude_ids") or "").strip()
+    if raw_excl:
+        try:
+            excl = json.loads(raw_excl)
+            if not isinstance(excl, list) or len(excl) > 50000 or not all(isinstance(x, str) for x in excl):
+                raise ValueError
+        except ValueError:
+            return jsonify({"error": "exclude_ids must be a JSON list of trade id strings"}), 400
+        excl = set(excl)
+        closed_trades = [t for t in closed_trades if _trade_id(t) not in excl]
     overwrite = (request.form.get("overwrite") or "").strip().lower() in ("1", "true", "on", "yes")
+    preview = (request.form.get("preview") or "").strip().lower() in ("1", "true", "on", "yes")
     skip_ids: set = set()
     lookup_failed = False
     if not overwrite:
@@ -330,6 +362,16 @@ def import_trades():
         else:
             skip_ids = existing
     log.info("import-trades: %d of %d trades already in journal (overwrite=%s)", len(skip_ids), len(closed_trades), overwrite)
+
+    if preview:
+        # Nothing is charted, graded or saved: just report what WOULD be imported.
+        slim = [{"trade_id": _trade_id(t), "Symbol": t.get("Symbol"), "Trade Date": t.get("Trade Date"),
+                 "Entry Time": t.get("Entry Time"), "Side": t.get("Side"), "P&L After Comm": t.get("P&L After Comm")}
+                for t in closed_trades]
+        return jsonify({"preview": True, "trades": slim, "skipped_rows": skipped,
+                        "already_imported": sorted(skip_ids), "existing_check_failed": lookup_failed,
+                        "ignored_incomplete": ignored, "file": file_summary,
+                        "window": {"date_from": date_from or None, "date_to": date_to or None}}), 200
 
     job_id = uuid.uuid4().hex
     cancel_event = threading.Event()
