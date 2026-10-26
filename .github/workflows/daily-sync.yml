@@ -1,0 +1,31 @@
+name: Daily IBKR sync trigger
+
+# Every 2 hours during the US trading day, plus once after the close. Each run is cheap: it asks IBKR
+# for the day's statement and only charts / asks the AI about trades that aren't saved yet.
+# 13:05-21:05 UTC covers the US session whether or not US daylight time is in effect, and
+# 22:30 UTC is the after-close catch-up. (Cairo is UTC+3 in summer, UTC+2 in winter.)
+# GitHub Actions cron is UTC and best-effort (can slip a few minutes under
+# load) -- fine for a daily job. This also doubles as the free-tier
+# wake-up ping: it's just a POST, chart_service.py does the real work in
+# a background thread and returns 202 immediately.
+
+on:
+  schedule:
+    - cron: "5 13-21/2 * * 1-5"
+    - cron: "30 22 * * 1-5"
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+
+jobs:
+  trigger-daily-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: POST /daily-sync
+        run: |
+          curl -sS -X POST "${RENDER_SERVICE_URL}/daily-sync" \
+            -H "X-Sync-Token: ${DAILY_SYNC_SECRET}" \
+            -w "\nHTTP %{http_code}\n" \
+            --max-time 30 \
+            --retry 3 --retry-delay 10
+        env:
+          RENDER_SERVICE_URL: ${{ secrets.RENDER_SERVICE_URL }}
+          DAILY_SYNC_SECRET: ${{ secrets.DAILY_SYNC_SECRET }}

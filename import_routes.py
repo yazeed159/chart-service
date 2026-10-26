@@ -59,6 +59,7 @@ POST /import-trades
   -> 400 / 401 / 422 -- see below
 
 GET /import-trades/<job_id>
+  Headers: Authorization: Bearer <supabase access token>   (required; only the job's owner may read it)
   -> 200 { "status": "processing", "phase": "charting" | "publishing",
            "total": <int>, "completed": <int>,
            "current": {"symbol", "trade_date"} | null,
@@ -91,6 +92,8 @@ from flask import Blueprint, request, jsonify
 from trade_matching import parse_csv_executions, fifo_match_and_merge, looks_like_csv_row, read_csv_sections, parse_csv_fees
 from supabase_auth import resolve_user_id
 
+_JOB_ID_RE = re.compile(r"[0-9a-f]{1,64}")
+
 log = logging.getLogger("chart_service.import_routes")
 bp = Blueprint("import_routes", __name__)
 
@@ -108,9 +111,40 @@ def _job_path(job_id: str) -> Path:
     return IMPORT_RUNS_DIR / f"{job_id}.json"
 
 
-def _write_job(job_id: str, data: dict):
+def _read_job(job_id: str) -> dict | None:
+    path = _job_path(job_id)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _write_job(job_id: str, data: dict, owner: str | None = None):
+    """Writes the job file. The owner (Supabase user id) is stamped on creation and
+    carried over on every later write, so status/cancel can check who is asking."""
     IMPORT_RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    if owner is None and "owner" not in data:
+        prev = _read_job(job_id)
+        owner = (prev or {}).get("owner")
+    if owner is not None:
+        data = {**data, "owner": owner}
     _job_path(job_id).write_text(json.dumps(data, indent=2, default=str))
+
+
+def _owned_job(job_id: str):
+    """(job_dict, None) if the caller owns the job, else (None, error_response). Someone
+    else's job -- or an old job file with no owner -- answers 404, same as an unknown id."""
+    user_id = resolve_user_id(request.headers.get("Authorization"))
+    if not user_id:
+        return None, (jsonify({"error": "missing or invalid Authorization token -- please log in and try again"}), 401)
+    if not _JOB_ID_RE.fullmatch(job_id):
+        return None, (jsonify({"error": "unknown job_id"}), 404)
+    job = _read_job(job_id)
+    if job is None or job.get("owner") != user_id:
+        return None, (jsonify({"error": "unknown job_id"}), 404)
+    return job, None
 
 
 def _trade_id(t: dict) -> str:
@@ -376,7 +410,7 @@ def import_trades():
     job_id = uuid.uuid4().hex
     cancel_event = threading.Event()
     _cancel_events[job_id] = cancel_event
-    _write_job(job_id, {"status": "processing", "total": len(closed_trades), "completed": 0, "current": None})
+    _write_job(job_id, {"status": "processing", "total": len(closed_trades), "completed": 0, "current": None}, owner=user_id)
     th = threading.Thread(target=_run_import_job, args=(job_id, closed_trades, cancel_event, skip_ids), daemon=True)
     th.start()
 
@@ -389,24 +423,31 @@ def import_trades():
 
 @bp.route("/import-trades/<job_id>", methods=["GET"])
 def import_trades_status(job_id):
-    path = _job_path(job_id)
-    if not path.exists():
-        return jsonify({"error": "unknown job_id"}), 404
-    return jsonify(json.loads(path.read_text()))
+    job, err = _owned_job(job_id)
+    if err:
+        return err
+    # A job still marked processing/cancelling whose worker thread is gone was cut off by a restart or
+    # deploy (the thread registers in _cancel_events and removes itself when it finishes). Answer 404
+    # so the import page stops polling forever; trades already published stay in the journal.
+    if job.get("status") in ("processing", "cancelling") and job_id not in _cancel_events:
+        return jsonify({"error": "interrupted", "detail": "the server restarted while this import was running"}), 404
+    job.pop("owner", None)  # internal bookkeeping, not part of the response
+    return jsonify(job)
 
 
 @bp.route("/import-trades/<job_id>/cancel", methods=["POST"])
 def import_trades_cancel(job_id):
+    _, err = _owned_job(job_id)
+    if err:
+        return err
     event = _cancel_events.get(job_id)
     if not event:
         return jsonify({"error": "unknown or already-finished job_id"}), 404
     event.set()
 
-    path = _job_path(job_id)
-    if path.exists():
-        data = json.loads(path.read_text())
-        if data.get("status") == "processing":
-            data["status"] = "cancelling"
-            _write_job(job_id, data)
+    data = _read_job(job_id)
+    if data and data.get("status") == "processing":
+        data["status"] = "cancelling"
+        _write_job(job_id, data)
 
     return jsonify({"status": "cancelling"}), 200

@@ -69,6 +69,13 @@ replaced, but there's no n8n in the loop anymore.
   as a wake-up ping for Render's free tier. Can also be triggered manually
   from the Actions tab (`workflow_dispatch`).
 
+### Added in the Oct 2026 audit fixes
+
+- `MAX_UPLOAD_MB` (default 25): requests with a larger body are rejected with a JSON 413 before being read into memory.
+- `GET /import-trades/<job_id>` and `POST /import-trades/<job_id>/cancel` now require `Authorization: Bearer <token>` and only answer for the job's owner (anyone else gets 404, same as an unknown id). Job files written before this change have no owner and are treated as not found.
+- `push.bat` does a plain `git push` (no `--force`).
+- `.github/workflows/tests.yml` runs `pytest` on every push.
+
 ## Auth model
 
 Two different patterns, by design:
@@ -118,8 +125,17 @@ reads `PORT` from the environment). `requirements.txt` covers it
 (`flask`, `requests`, `pandas`, `mplfinance`, `matplotlib`, `tzdata`).
 
 GitHub Actions (`daily-sync.yml`) hits `POST {RENDER_SERVICE_URL}/daily-sync`
-once a day — set the `RENDER_SERVICE_URL` repo secret to your Render
-service's base URL.
+on weekdays (every 2 hours 13:05-21:05 UTC plus 22:30 UTC) — set the `RENDER_SERVICE_URL` and
+`DAILY_SYNC_SECRET` repo secrets. Both workflow files must live in `.github/workflows/`:
+`daily-sync.yml` (the sync) and `keepalive.yml` (pings `/health` every 10 minutes, 08:00-14:50 UTC, to keep the pre-market scanner alive).
+
+## Browser error reports
+
+`POST /client-errors` (`client_errors.py`) receives uncaught errors from the web app's safety net
+(`js/app-boot.js`) so they appear in Render's logs even when you weren't the one at the screen.
+Search the log stream for `client-error`: each hit is one JSON line (time, kind, message, page, stack,
+browser, and the first 8 characters of the user id). It needs a signed-in user, caps each body at
+8 KB, and rate-limits per IP (60 / 10 min) and per user (30 / hour).
 
 ## Local development (optional)
 

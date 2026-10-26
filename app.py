@@ -1,5 +1,6 @@
 """
-app.py
+app.py  (NOTE: this is the live-trading CONTROL API run next to the IBKR engine, NOT the Render
+chart service -- that is chart_service.py. The filename is kept because docker-compose references it.)
 Control API for the live trading engine -- start/stop strategy runs, poll
 status, read recent signal/fill events. Frontend counterpart:
 web-service/live-trading.html + live-trading.js.
@@ -41,7 +42,13 @@ _ib_util.logToConsole(logging.DEBUG)
 log = logging.getLogger("live_app")
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=False)
+# Browsers may only call this API from the origins listed in LIVE_CORS_ORIGINS (comma-separated, e.g.
+# "https://your-app.pages.dev"). Requests still need a valid Supabase token either way. If the variable
+# is unset it falls back to any origin, as before, and logs a warning so you remember to set it.
+_origins = [o.strip() for o in os.environ.get("LIVE_CORS_ORIGINS", "").split(",") if o.strip()]
+if not _origins:
+    log.warning("LIVE_CORS_ORIGINS is not set -- allowing any origin. Set it to your site's origin(s).")
+CORS(app, resources={r"/api/*": {"origins": _origins or "*"}}, supports_credentials=False)
 
 _loop: asyncio.AbstractEventLoop | None = None
 _loop_ready = threading.Event()

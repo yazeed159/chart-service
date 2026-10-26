@@ -21,6 +21,17 @@ log = logging.getLogger("chart_service")
 
 app = Flask(__name__)
 
+# Hard cap on any request body. Without it a single huge upload is read fully into
+# memory and can take a small Render instance down. Broker statements are a few MB at
+# most; raise MAX_UPLOAD_MB in the environment if you ever need more.
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", 25))
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+
+
+@app.errorhandler(413)
+def _too_large(_e):
+    return jsonify({"error": f"file too large -- the limit is {MAX_UPLOAD_MB} MB"}), 413
+
 # matplotlib/mplfinance keep process-global state (current figure/axes) that is
 # NOT thread-safe. app.run(threaded=True) below hands each request its own
 # thread, so two requests rendering at the same time can corrupt or deadlock on

@@ -15,15 +15,20 @@ def client(existing=()):
     ir.resolve_user_id = lambda h: "u1"
     publish.resolve_account_id = lambda u, a: "acc"
     ir._existing_trade_ids = lambda u, ids: set(i for i in ids if i in existing)
-    # a preview must never start a background job
-    ir.threading.Thread = lambda *a, **k: (_ for _ in ()).throw(AssertionError("job started during preview"))
     app = Flask(__name__)
     app.register_blueprint(ir.bp)
     return app.test_client()
 
 
 def post(c, **form):
-    return c.post("/import-trades", data={"trade_csv": (io.BytesIO(CSV.encode()), "t.csv"), **form}, content_type="multipart/form-data")
+    # a preview must never start a background job. The patch lasts for this one request only:
+    # threading.Thread is process-wide, so leaving it patched breaks every test that runs after this one.
+    real = ir.threading.Thread
+    ir.threading.Thread = lambda *a, **k: (_ for _ in ()).throw(AssertionError("job started during preview"))
+    try:
+        return c.post("/import-trades", data={"trade_csv": (io.BytesIO(CSV.encode()), "t.csv"), **form}, content_type="multipart/form-data")
+    finally:
+        ir.threading.Thread = real
 
 
 def test_preview_returns_trades_and_starts_no_job():

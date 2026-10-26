@@ -256,5 +256,8 @@ app.register_blueprint(backtest_import_bp)
 from daily_sync import bp as daily_sync_bp
 app.register_blueprint(daily_sync_bp)
 
+from client_errors import bp as client_errors_bp
+app.register_blueprint(client_errors_bp)
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5001)), threaded=True)

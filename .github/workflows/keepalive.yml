@@ -1,0 +1,26 @@
+name: Pre-market keepalive
+
+# Keeps Render's free instance awake through the 4:00-9:30 ET pre-market scan so the
+# scanner.py / scanner_enrich.py threads aren't killed when the service spins down.
+# 4:00 ET is 08:00 UTC in summer (EDT) and 09:00 UTC in winter (EST); 9:30 ET is 13:30 / 14:30 UTC.
+# Running 08:00-14:50 UTC covers both. GitHub's cron is best-effort and can be delayed under
+# load, so an external pinger (cron-job.org / UptimeRobot) is still the more reliable option.
+
+on:
+  schedule:
+    - cron: "*/10 8-14 * * 1-5"
+  workflow_dispatch: {}
+
+jobs:
+  ping-health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: GET /health
+        run: |
+          curl -sS "${RENDER_SERVICE_URL}/health" \
+            -w "\nHTTP %{http_code}\n" \
+            --max-time 60 \
+            --retry 2 --retry-delay 5
+        env:
+          RENDER_SERVICE_URL: ${{ secrets.RENDER_SERVICE_URL }}
