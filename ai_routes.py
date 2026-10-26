@@ -26,10 +26,15 @@ POST /support-resistance
   reply doesn't parse.
 
 POST /trade-chat
-  { "message", "history": [{role, content}, ...], "trades_summary": {...},
-    "trades_sample": [...], "matched_trade_line": str|null,
-    "chart_context": {...}|null }
-  -> { "reply": str }
+  { "message", "history": [{role, content}, ...],
+    "facts": {"core": str, "<topic>": str, ...}|absent,   # v2: tables the browser pre-computed
+    "topics": [str],                                       # which topics the router picked
+    "trades_summary": {...}, "trades_sample": [...],       # v1 fallback when "facts" is absent
+    "matched_trade_line": str|null, "chart_context": {...}|null }
+  -> { "reply": str }  (+ "error": true / "rate_limited": true when it isn't a real answer)
+  The free-tier cost story: the browser answers plain stat questions itself and only calls this
+  for the rest, with just the relevant fact tables (a few hundred tokens), so one call is cheap.
+  A per-IP hourly cap (CHAT_RATE_PER_HOUR, default 60) stops a stray client burning the key.
 
 POST /backtest-ai
   { "message", "history": [...], "draft": {...}, "schema": {...} }
@@ -69,6 +74,25 @@ GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_M
 SR_TIMEOUT_S = 45
 CHAT_TIMEOUT_S = 45
 BACKTEST_AI_TIMEOUT_S = 175
+
+# Per-IP sliding window for /trade-chat only. In-process (per gunicorn worker), so it's a
+# safety net against a runaway client rather than exact accounting.
+CHAT_RATE_PER_HOUR = int(os.environ.get("CHAT_RATE_PER_HOUR", "60"))
+_chat_hits = {}
+
+
+def _chat_rate_limited(ip: str) -> bool:
+    now = time.time()
+    hits = [t for t in _chat_hits.get(ip, []) if now - t < 3600]
+    if len(hits) >= CHAT_RATE_PER_HOUR:
+        _chat_hits[ip] = hits
+        return True
+    hits.append(now)
+    _chat_hits[ip] = hits
+    if len(_chat_hits) > 2000:
+        for k in [k for k, v in _chat_hits.items() if not v or now - v[-1] >= 3600]:
+            _chat_hits.pop(k, None)
+    return False
 
 
 def _call_gemini(payload: dict, timeout: float) -> dict:
@@ -198,93 +222,128 @@ def trade_chat():
     if request.method == "OPTIONS":
         return "", 204
 
+    ip = (request.headers.get("X-Forwarded-For", "").split(",")[0].strip()) or (request.remote_addr or "?")
+    if _chat_rate_limited(ip):
+        return jsonify({
+            "reply": "That's a lot of messages in a short time -- give it a few minutes and try again.",
+            "error": True, "rate_limited": True,
+        }), 429
+
     body = request.get_json(force=True, silent=True) or {}
     message = str(body.get("message") or "")[:4000]
     history = body.get("history") if isinstance(body.get("history"), list) else []
+    facts = body.get("facts") if isinstance(body.get("facts"), dict) else None
     summary = body.get("trades_summary") or {}
     sample = body.get("trades_sample") if isinstance(body.get("trades_sample"), list) else []
     matched_trade_line = body.get("matched_trade_line")
     chart_context = body.get("chart_context")
 
+    # Stable instructions first and facts last: Gemini's implicit prompt caching keys on a shared
+    # prefix, so the unchanging part of the prompt is the cheap part.
     system_parts = [
-        "You are the AI assistant embedded in this trader's personal trading journal (trade.log).",
+        "You are the AI coach inside this trader's personal trading journal (trade.log).",
         "The trader runs a Ross Cameron style small-cap breakout and momentum strategy: low-float,",
         "high-relative-volume stocks in play on news or gaps, entries on VWAP reclaims, opening-range",
         "breakouts, first-pullback / first-green-day setups, bull flags and micro pullbacks inside an",
         "established momentum move, scaling out into strength, and cutting losers fast at a hard stop",
         "instead of averaging down or hoping. Chasing extended moves far above VWAP, moving a stop",
-        "further away, oversized position risk, and holding once the setup is clearly invalidated are",
-        "all deviations from that playbook -- call them out plainly when the data shows them, citing",
-        "the actual trade.",
+        "further away, oversized position risk, revenge re-entries after a loss, and holding once the",
+        "setup is clearly invalidated are all deviations from that playbook -- call them out plainly",
+        "when the data shows them, citing the actual numbers or trade.",
         "",
-        "Aggregate stats across ALL of the trader's logged trades (computed client-side from",
-        "data/trades.json -- this covers win rate, PnL, per-setup breakdown, and lesson-tag frequency",
-        "for the full journal, not just the sample below):",
-        json.dumps(summary, indent=2),
-        "",
-        f"Curated sample ({len(sample)} rows, NOT the full journal -- this is the worst losses, best",
-        "wins, and most recent trades, deduped, oldest first, one line each --",
-        "id | date | symbol | side | setup_type | result | net_pnl | shares | entry->exit | lesson_tags | rvol_tag):",
-        "\n".join(sample),
+        "HOW TO ANSWER",
+        "- The FACTS below were computed by code from the trader's FULL journal. They are exact: quote",
+        "  them, never recompute them, never contradict them.",
+        "- Open with the direct answer in one sentence. Then 2-4 supporting points using the real",
+        "  numbers. End with ONE concrete thing to change or watch next session, tied to the playbook.",
+        "- Aim for under about 170 words unless the trader asks for detail. Short bullet lists are fine;",
+        "  no headings, no tables, no preamble, no praise, don't restate the question.",
+        "- A bucket with fewer than ~8 trades is weak evidence: say so instead of calling it a pattern.",
+        "- If the facts don't contain what's needed, say exactly what is missing instead of guessing.",
+        "  Useful limits: planned stop / R-multiple isn't logged (dollars and share size only), and how",
+        "  much a winner gave back before exit needs the Edge Analysis page's bar-level run.",
+        "- For a 'why' or 'what should I do' question, reason from the numbers shown and the playbook;",
+        "  correlation in a small journal isn't proof, and it's fine to say that in a clause.",
     ]
+
+    if facts:
+        total = 0
+        ordered = sorted(facts.items(), key=lambda kv: 0 if kv[0] == "core" else 1)
+        system_parts += ["", "FACTS (computed from the full journal):"]
+        for topic, text in ordered:
+            text = str(text or "")
+            if not text or total > 9000:
+                continue
+            text = text[:3500]
+            total += len(text)
+            system_parts += ["", f"[{topic}]", text]
+    else:
+        # v1 clients: aggregate summary + a curated sample of trades.
+        system_parts += [
+            "",
+            "Aggregate stats across ALL of the trader's logged trades:",
+            json.dumps(summary, indent=2),
+            "",
+            f"Curated sample ({len(sample)} rows, NOT the full journal -- worst losses, best wins and most",
+            "recent trades, one line each --",
+            "id | date | symbol | side | setup_type | result | net_pnl | shares | entry->exit | lesson_tags | rvol_tag):",
+            "\n".join(str(x) for x in sample),
+        ]
+
     if matched_trade_line:
         system_parts += [
             "",
-            "The trader's message appears to reference this specific logged trade (same line format as above):",
-            matched_trade_line,
+            "The trader's message is about this specific logged trade (same line format as above):",
+            str(matched_trade_line),
         ]
-    if chart_context and chart_context.get("indicators"):
+    if isinstance(chart_context, dict) and chart_context.get("indicators"):
         system_parts += [
             "",
-            f"Live chart indicators for {chart_context.get('symbol')} on {chart_context.get('trade_date')} "
-            "(fetched just now from Polygon via chart_service.py, price/VWAP/EMA/MACD at entry, computed "
+            f"Indicators for {chart_context.get('symbol')} on {chart_context.get('trade_date')} "
+            "(fetched from Polygon via chart_service.py: price/VWAP/EMA/MACD at entry, computed "
             "S/R stop & target, volume/float context):",
-            json.dumps(chart_context["indicators"], indent=2),
+            json.dumps(chart_context["indicators"], separators=(",", ":")),
         ]
-    system_parts += [
-        "",
-        "Only state facts supported by the data above. The aggregate stats cover the full journal; the",
-        "sample and any matched trade are illustrative, not exhaustive. If asked about a specific trade,",
-        "date, or number that isn't in the data above, say plainly that you don't have that detail rather",
-        "than inventing it -- don't assume a trade is representative of the whole journal, or vice versa.",
-        "Reference specific trades/dates/numbers where it helps. Keep answers conversational and only",
-        "as long as the question calls for.",
-    ]
     system_prompt = "\n".join(system_parts)
 
     contents = []
-    for turn in history[-8:]:
+    for turn in history[-6:]:
         role = "model" if turn.get("role") == "assistant" else "user"
-        text = str(turn.get("content") or "")[:2000]
+        text = str(turn.get("content") or "")[:800]
         if text:
             contents.append({"role": role, "parts": [{"text": text}]})
     contents.append({"role": "user", "parts": [{"text": message}]})
 
-    reply = ""
     try:
         gem = _call_gemini({
             "contents": contents,
             "systemInstruction": {"parts": [{"text": system_prompt}]},
             "generationConfig": {
-                "temperature": 0.4,
-                "maxOutputTokens": 2048,
-                # "minimal" is the lowest tier Gemini 3 models expose --
-                # there's no true "off" (thinkingLevel only accepts
-                # minimal/low/medium/high; "none" is rejected outright).
-                # Google's own docs describe "minimal" as matching "no
-                # thinking" for most queries, which is what this route
-                # wants: a conversational reply, not multi-step reasoning.
-                # Dropped from "low" since that was adding real wall-clock
-                # latency to every chat message for no visible benefit.
+                "temperature": 0.3,
+                # Answers are meant to be ~170 words; this is headroom, not a target.
+                "maxOutputTokens": 800,
+                # "minimal" is the lowest tier Gemini 3 models expose (no true "off"; "none" is
+                # rejected). The numbers are pre-computed, so the model only has to explain
+                # them -- extra thinking would add latency and cost for no visible gain.
                 "thinkingConfig": {"thinkingLevel": "minimal"},
             },
         }, timeout=CHAT_TIMEOUT_S)
         reply = _extract_text(gem)
+    except requests.HTTPError as e:
+        status = getattr(e.response, "status_code", None)
+        log.error("Chat: Gemini HTTP %s: %s", status, e)
+        if status == 429:
+            return jsonify({
+                "reply": "The AI hit its free-tier rate limit. Give it a minute and try again; stat questions still work instantly.",
+                "error": True, "rate_limited": True,
+            }), 429
+        return jsonify({"reply": "Sorry, the AI service returned an error just now -- give it another try.", "error": True})
     except requests.RequestException as e:
         log.error("Chat: Gemini call failed: %s", e)
+        return jsonify({"reply": "Sorry, I couldn't reach the AI just now -- give it another try.", "error": True})
 
     if not reply:
-        reply = "Sorry, I couldn't generate a response just now -- give it another try."
+        return jsonify({"reply": "Sorry, I couldn't generate a response just now -- give it another try.", "error": True})
     return jsonify({"reply": reply})
 
 
